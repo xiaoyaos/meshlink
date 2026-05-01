@@ -79,27 +79,78 @@ p2p-node-windows-amd64.exe -port 4001 -relay -config .\server_config
 
 ---
 
-## 🛠 进阶：服务器后台长期运行（systemd）
+## 🛠 进阶：Linux 服务器一键部署
 
-```ini
-# /etc/systemd/system/p2p.service
-[Unit]
-Description=P2P Network Node
-After=network.target
+如果你需要在公网 Linux 服务器上长期运行**引导节点**，我们提供了一键安装和打包脚本。
 
-[Service]
-ExecStart=/usr/local/bin/p2p-node -port 4001 -relay -config /etc/p2p/config
-Restart=always
-User=root
+### 1. 获取安装包
 
-[Install]
-WantedBy=multi-user.target
-```
+你可以从 [Releases](../../releases) 页面下载 `meshlink-linux-<version>.tar.gz`，或者自己编译打包：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable p2p
-sudo systemctl start p2p
+# 在含有 Makefile 的源码目录运行
+make package-linux VERSION=1.0.0
+```
+产物在 `dist/meshlink-linux-1.0.0.tar.gz`。
+
+### 2. 上传并解压
+
+```bash
+# 传到服务器（将 1.2.3.4 替换为你的服务器 IP）
+scp dist/meshlink-linux-1.0.0.tar.gz root@1.2.3.4:/tmp/
+
+# 在服务器上解压
+cd /tmp && tar xzf meshlink-linux-1.0.0.tar.gz && cd meshlink-linux-1.0.0
+```
+
+### 3. 一键安装并运行
+
+```bash
+# 一键安装，开启中继模式，端口 4001
+sudo bash install.sh --relay
+
+# 或者自定义端口
+sudo bash install.sh --relay --port 5001
+```
+
+安装脚本会自动将节点注册为 `systemd` 服务，并设置开机自启。
+
+### 4. 获取节点地址
+
+节点启动后，它的 `Multiaddr`（供客户端连接时填入）会自动保存在配置文件中：
+
+```bash
+cat /etc/meshlink/data/address.txt
+```
+输出示例：
+```text
+Virtual IP: 10.1.179.163
+
+Multiaddr:
+/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
+/ip4/127.0.0.1/tcp/4001/p2p/12D3KooW...
+```
+
+### 常用管理命令
+
+安装成功后，系统已自动注册全局 `meshlink` 命令，随时随地可用：
+
+```bash
+meshlink status          # 查看服务运行状态
+meshlink logs            # 实时查看节点日志
+meshlink restart         # 重启节点服务
+meshlink address         # 直接打印本节点的 Multiaddr 地址
+meshlink start           # 启动服务
+meshlink stop            # 停止服务
+
+nano /etc/meshlink/meshlink.env    # 修改端口或配置参数（修改后需 restart）
+```
+
+### 卸载节点
+
+```bash
+sudo bash uninstall.sh             # 卸载服务（保留配置和密钥）
+sudo bash uninstall.sh --purge     # 彻底清除（包含身份密钥，不可恢复）
 ```
 
 ---
@@ -107,7 +158,7 @@ sudo systemctl start p2p
 ## 🔍 常见问题排查
 
 ### Q1: 连接成功但 Ping 不通对方？
-- **防火墙**：确保两端没有拦截 ICMP 协议。
+- **防火墙**：确保两端没有拦截 ICMP 协议。如果是自建的 Linux 节点，确保开放了对应的 TCP/UDP 端口（如：`sudo ufw allow 4001`）。
 - **路由冲突**：确保物理网段不是 `10.x.x.x`。
 - **DHT 延迟**：首次连接后，DHT 寻址可能需要 10-30 秒，请稍等。
 
@@ -131,8 +182,14 @@ make release-cli
 # 编译 macOS GUI（在 macOS 上运行）
 make release-gui
 
-# Windows GUI 需要在 Windows 上运行，或通过 GitHub Actions 自动构建
-# 推送 tag 即可触发：git tag v1.0.0 && git push origin v1.0.0
+# 编译 Windows GUI（通过 Docker 交叉编译，需先运行 make docker-builder）
+make release-gui-windows
+
+# 打包 Linux 服务端发行包
+make package-linux VERSION=1.0.0
+
+# 一键编译所有产物
+make dist
 ```
 
-产物位置：`release/` 目录。
+产物位置：`release/` 和 `dist/` 目录。

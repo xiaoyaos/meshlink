@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,7 +54,7 @@ func (b *Bridge) readTunLoop() {
 	for {
 		n, err := b.tun.Read(buf)
 		if err != nil {
-			fmt.Printf("TUN read error: %v\n", err)
+			fmt.Printf("[桥接] 读取虚拟网卡失败: %v\n", err)
 			return
 		}
 
@@ -75,16 +76,24 @@ func (b *Bridge) handleOutgoingPacket(data []byte) {
 			return
 		}
 
-		peerID, err := b.resolvePeerID(dstIP)
-		if err != nil {
-			fmt.Printf("[Bridge] Could not resolve PeerID for IP %s: %v\n", dstIP, err)
+		// 严格过滤：只处理目标 IP 是 10.x.x.x 虚拟子网的包
+		// 这可以拦截系统泄露的外部公网 IP、组播（224.x）、广播等
+		if !strings.HasPrefix(dstIP, "10.") {
 			return
 		}
 
-		fmt.Printf("[Bridge] Sending packet (%d bytes) to Peer %s\n", len(data), peerID)
-		if err := b.node.SendPacket(peerID, data); err != nil {
-			fmt.Printf("[Bridge] Failed to send packet: %v\n", err)
+		peerID, err := b.resolvePeerID(dstIP)
+		if err != nil {
+			fmt.Printf("[寻址失败] 找不到目标 IP (%s) 对应的设备，可能对方已掉线或尚未广播 IP: %v\n", dstIP, err)
+			return
 		}
+
+		fmt.Printf("[数据流向] 虚拟网卡发出 -> P2P隧道 (目标IP: %s, 大小: %d 字节, 接收节点: %s)\n", dstIP, len(data), peerID)
+		if err := b.node.SendPacket(peerID, data); err != nil {
+			fmt.Printf("[错误] 通过 P2P 隧道发送数据失败: %v\n", err)
+		}
+	} else {
+		fmt.Printf("[拦截] 拦截到非 IPv4 流量，已自动丢弃 (大小: %d 字节)\n", len(data))
 	}
 }
 
@@ -112,14 +121,17 @@ func (b *Bridge) resolvePeerID(ip string) (peer.ID, error) {
 func (b *Bridge) advertiseIPLoop() {
 	c, _ := ipToCid(b.tun.IP.String())
 	
-	ticker := time.NewTicker(time.Minute * 5)
+	// 初始化时如果 DHT 里还没节点，重试间隔设短一点
+	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
 	for {
 		if err := b.node.DHT.Provide(b.ctx, c, true); err != nil {
-			fmt.Printf("[Bridge] Failed to advertise IP in DHT: %v\n", err)
+			fmt.Printf("[网络寻址] ⚠️ 尚未同步路由表，正在尝试全网广播本机 IP (%s)... (将不断重试直到成功)\n", b.tun.IP.String())
+			ticker.Reset(time.Second * 5) // 失败则 5 秒后重试
 		} else {
-			fmt.Printf("[Bridge] IP %s advertised successfully\n", b.tun.IP.String())
+			fmt.Printf("[网络寻址] ✅ 成功广播本机 IP (%s)！网络中的其他设备现在可以连接到你了。\n", b.tun.IP.String())
+			ticker.Reset(time.Minute * 5) // 成功后，只需每 5 分钟保活一次
 		}
 		
 		select {

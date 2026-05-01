@@ -74,9 +74,9 @@ func NewNode(priv crypto.PrivKey, listenAddr string, enableRelay bool) (*Node, e
 	if enableRelay {
 		r, err = relay.New(h)
 		if err != nil {
-			fmt.Printf("failed to start relay service: %v\n", err)
+			fmt.Printf("[节点功能] ⚠️ 开启中继(Relay)功能失败: %v\n", err)
 		} else {
-			fmt.Println("Relay service enabled.")
+			fmt.Println("[节点功能] 🚀 中继(Relay)功能已开启，本机将协助其他设备穿透内网。")
 		}
 	}
 
@@ -104,6 +104,7 @@ func (n *Node) handleStream(s network.Stream) {
 			return
 		}
 		if n.PacketHandler != nil {
+			fmt.Printf("[数据流向] P2P隧道收到 -> 写入虚拟网卡 (发送方节点: %s, 大小: %d 字节)\n", s.Conn().RemotePeer(), read)
 			n.PacketHandler(buf[:read])
 		}
 	}
@@ -127,19 +128,19 @@ func (n *Node) Bootstrap(addrs []string) error {
 	for _, addrStr := range addrs {
 		addr, err := multiaddr.NewMultiaddr(addrStr)
 		if err != nil {
-			fmt.Printf("invalid multiaddr %s: %v\n", addrStr, err)
+			fmt.Printf("[引导连接] ⚠️ 引导节点地址格式不正确 (%s): %v\n", addrStr, err)
 			continue
 		}
 		info, err := peer.AddrInfoFromP2pAddr(addr)
 		if err != nil {
-			fmt.Printf("invalid addr info %s: %v\n", addrStr, err)
+			fmt.Printf("[引导连接] ⚠️ 无法解析引导节点的真实地址 (%s): %v\n", addrStr, err)
 			continue
 		}
-		fmt.Printf("Attempting to connect to bootstrap node: %s\n", info.ID)
+		fmt.Printf("[引导连接] 🔄 正在尝试连接至引导节点: %s\n", info.ID)
 		if err := n.Host.Connect(n.Ctx, *info); err != nil {
-			fmt.Printf("FAILED to connect to bootstrap node %s: %v\n", info.ID, err)
+			fmt.Printf("[引导连接] ❌ 连接引导节点失败 (%s): %v\n", info.ID, err)
 		} else {
-			fmt.Printf("SUCCESSFULLY connected to bootstrap node: %s\n", info.ID)
+			fmt.Printf("[引导连接] ✅ 成功连接引导节点！本机已接入 MeshLink 网络 (%s)。\n", info.ID)
 			connected = true
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+
 	"p2p/pkg/app"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -69,8 +70,5 @@ func (a *App) StopVPN() {
 
 // GetPeerCount 返回当前连接的节点数量
 func (a *App) GetPeerCount() int {
-	if a.service == nil || a.service.GetNode() == nil {
-		return 0
-	}
-	return len(a.service.GetNode().Host.Network().Peers())
+	return 0
 }

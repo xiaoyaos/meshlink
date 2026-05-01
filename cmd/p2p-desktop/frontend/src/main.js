@@ -2,6 +2,8 @@ import './style.css';
 import { GetInfo, StartVPN, StopVPN, GetPeerCount } from '../wailsjs/go/main/App';
 import { EventsOn } from '../wailsjs/runtime/runtime';
 
+
+
 // DOM Elements
 const peerIdEl = document.getElementById('peer-id');
 const virtualIpEl = document.getElementById('virtual-ip');
