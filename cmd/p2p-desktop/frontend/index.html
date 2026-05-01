@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Mesh Network</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <script>
+      window.onerror = function(msg, url, line, col, error) {
+        const errDiv = document.createElement('div');
+        errDiv.style.cssText = 'position:fixed;top:0;left:0;width:100%;background:red;color:white;z-index:9999;padding:20px;font-family:monospace;white-space:pre-wrap;';
+        errDiv.innerText = 'JS Error: ' + msg + '\nLine: ' + line + '\nCol: ' + col + '\nStack: ' + (error && error.stack);
+        document.body.appendChild(errDiv);
+      };
+      window.addEventListener('unhandledrejection', function(event) {
+        const errDiv = document.createElement('div');
+        errDiv.style.cssText = 'position:fixed;top:0;left:0;width:100%;background:red;color:white;z-index:9999;padding:20px;font-family:monospace;white-space:pre-wrap;';
+        errDiv.innerText = 'Promise Rejection: ' + event.reason;
+        document.body.appendChild(errDiv);
+      });
+    </script>
+    <!-- Wails native draggable region -->
+    <div class="title-bar" style="--wails-draggable:drag">
+      <div class="title-text">P2P 虚拟网状网络</div>
+    </div>
+
+    <div id="app" class="app-container">
+      <!-- Sidebar for controls and identity -->
+      <aside class="sidebar glass-panel">
+        <div class="glass-header">
+          <h2>我的身份信息</h2>
+        </div>
+        <div class="info-group">
+          <label>节点 ID (PeerID)</label>
+          <div class="input-wrapper">
+            <span id="peer-id">加载中...</span>
+            <button class="icon-btn" id="copy-peer" title="复制到剪贴板">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+        </div>
+        <div class="info-group">
+          <label>虚拟 IP 地址</label>
+          <div class="vip-display" id="virtual-ip">0.0.0.0</div>
+        </div>
+
+        <div class="separator"></div>
+
+        <div class="glass-header">
+          <h2>网络配置</h2>
+        </div>
+        <div class="info-group">
+          <label>引导节点地址 (可选)</label>
+          <input type="text" id="bootstrap-input" class="glass-input" placeholder="例如: /ip4/...">
+        </div>
+        
+        <button class="glass-btn btn-start" id="toggle-btn">
+          <span class="btn-text">启动网络</span>
+          <div class="btn-glow"></div>
+        </button>
+
+        <div class="status-panel">
+          <div class="status-indicator">
+            <div class="status-dot" id="status-dot"></div>
+            <div class="status-pulse" id="status-pulse"></div>
+          </div>
+          <div class="status-info">
+            <span id="status-text" class="status-text">未连接</span>
+            <span id="peer-count" class="peer-count">0 个节点</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main area for visualization and logs -->
+      <main class="main-content">
+        <div class="viz-container glass-panel">
+          <!-- Canvas for network topology visualization -->
+          <canvas id="network-canvas"></canvas>
+          <div class="viz-overlay">
+            <h3>网络拓扑图</h3>
+            <p>可视化连接节点</p>
+          </div>
+        </div>
+
+        <div class="log-container glass-panel">
+          <div class="log-header">
+            <h3>运行日志</h3>
+          </div>
+          <div class="log-view" id="log-view">
+            <div class="log-entry system">等待网络启动...</div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <script src="/src/main.js" type="module"></script>
+</body>
+</html>

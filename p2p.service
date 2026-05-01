@@ -1,0 +1,18 @@
+[Unit]
+Description=P2P Virtual Mesh Network Node
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# 确保该路径在服务器上存在，或者改为 /tmp
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/p2p-node -port 4001 -config /etc/p2p_node -relay
+Restart=always
+RestartSec=5
+# 传统日志记录方式，由 journald 接管
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

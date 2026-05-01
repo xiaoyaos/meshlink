@@ -1,0 +1,131 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ─── CLI 节点（无 CGO，全平台交叉编译）────────────────────────────────
+  build-cli:
+    name: Build CLI Node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build CLI (all platforms)
+        run: |
+          mkdir -p release/cli
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64  go build -ldflags="-s -w" -o release/cli/p2p-node-darwin-arm64  ./cmd/p2p
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64  go build -ldflags="-s -w" -o release/cli/p2p-node-darwin-amd64  ./cmd/p2p
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64  go build -ldflags="-s -w" -o release/cli/p2p-node-linux-amd64   ./cmd/p2p
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64  go build -ldflags="-s -w" -o release/cli/p2p-node-linux-arm64   ./cmd/p2p
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64  go build -ldflags="-s -w" -o release/cli/p2p-node-windows-amd64.exe ./cmd/p2p
+
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-binaries
+          path: release/cli/
+
+  # ─── GUI 桌面端（macOS）────────────────────────────────────────────────
+  build-gui-macos:
+    name: Build GUI (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build GUI (macOS universal)
+        run: |
+          mkdir -p release/gui
+          cd cmd/p2p-desktop
+          wails build -platform darwin/universal -ldflags="-s -w"
+          mv build/bin/p2p-desktop.app ../../release/gui/p2p-gui-macos.app
+
+      - name: Zip macOS .app
+        run: |
+          cd release/gui
+          zip -r p2p-gui-macos.zip p2p-gui-macos.app
+
+      - name: Upload macOS GUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-macos
+          path: release/gui/p2p-gui-macos.zip
+
+  # ─── GUI 桌面端（Windows）────────────────────────────────────────────
+  build-gui-windows:
+    name: Build GUI (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build GUI (Windows amd64)
+        run: |
+          mkdir -p release/gui
+          cd cmd/p2p-desktop
+          wails build -platform windows/amd64 -ldflags="-s -w" -nsis
+          copy build\bin\p2p-desktop-amd64-installer.exe ..\..\release\gui\p2p-gui-windows-setup.exe
+        shell: cmd
+
+      - name: Upload Windows GUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-windows
+          path: release/gui/p2p-gui-windows-setup.exe
+
+  # ─── 合并产物并发布 Release ─────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [build-cli, build-gui-macos, build-gui-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cli-binaries/*
+            dist/gui-macos/*
+            dist/gui-windows/*
+          generate_release_notes: true

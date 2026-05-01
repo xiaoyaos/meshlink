@@ -1,0 +1,32 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.app
+p2p-node
+p2p-gui
+
+# Go workspace
+*.test
+*.out
+/vendor/
+
+# P2P Node Config & DBs
+/config/
+/diag_config/
+/node*/
+*.key
+*.db
+
+# Windows Driver (downloaded at build time, do not commit binary)
+# pkg/tun/wintun.dll
+
+# Build artifacts
+/release/
+
+# OS/IDE specific
+.DS_Store
+.idea/
+.vscode/
