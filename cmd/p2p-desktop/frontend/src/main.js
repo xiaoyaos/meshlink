@@ -21,6 +21,23 @@ const canvas = document.getElementById('network-canvas');
 let isRunning = false;
 let peerCount = 0;
 
+function installWailsCallbackGuard() {
+    if (!window.wails || typeof window.wails.Callback !== 'function' || window.wails.__meshlinkCallbackGuard) {
+        return;
+    }
+
+    const originalCallback = window.wails.Callback.bind(window.wails);
+    window.wails.Callback = (message) => {
+        if (typeof message !== 'string' || message.trim() === '') {
+            console.warn('Ignored empty Wails callback message');
+            return;
+        }
+        return originalCallback(message);
+    };
+    window.wails.__meshlinkCallbackGuard = true;
+}
+installWailsCallbackGuard();
+
 // ==========================================
 // P2P Network Canvas Animation
 // ==========================================
@@ -210,10 +227,11 @@ toggleBtn.onclick = async () => {
 
 // Events from Go
 EventsOn("vpn_log", (msg) => {
-    appendLog(msg);
+    appendLog(String(msg ?? ''));
 });
 
 EventsOn("vpn_state", (state) => {
+    state = Number(state);
     toggleBtn.classList.remove('disabled');
     
     switch (state) {

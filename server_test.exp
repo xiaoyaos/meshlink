@@ -1,0 +1,46 @@
+#!/usr/bin/expect -f
+set timeout 120
+set ip "8.136.129.162"
+set user "root"
+set pass "Hjj123456"
+set bootstrap "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLd56gZpYP2Q1hejJ2juN6GoYQcA9VMTcek6aetTRfwYi"
+set target_vip "10.98.237.157"
+
+spawn ssh -o StrictHostKeyChecking=no $user@$ip
+expect "password:"
+send "$pass\r"
+expect "# "
+
+# Start Node B (Temporary)
+# We use /tmp/nodeB as config dir
+send "mkdir -p /tmp/nodeB\r"
+expect "# "
+send "nohup p2p-node -port 4005 -config /tmp/nodeB -bootstrap \"$bootstrap\" > /tmp/nodeB.log 2>&1 &\r"
+expect "# "
+
+# Wait for Node B to get ready and find Node A
+send "sleep 15\r"
+expect "# "
+
+# Check Node B log
+send "cat /tmp/nodeB.log\r"
+expect "# "
+
+# Ping Node A from Node B
+send "ping -c 5 $target_vip\r"
+expect {
+    "5 packets transmitted, 5 packets received" {
+        puts "\n[SUCCESS] CROSS_NODE_PING_PASSED\n"
+    }
+    timeout {
+        puts "\n[FAILURE] PING_TIMEOUT\n"
+    }
+}
+
+# Cleanup Node B
+send "pkill -f \"p2p-node -port 4005\"\r"
+expect "# "
+send "rm -rf /tmp/nodeB /tmp/nodeB.log\r"
+expect "# "
+send "exit\r"
+expect eof

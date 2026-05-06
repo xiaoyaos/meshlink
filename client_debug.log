@@ -1,0 +1,4 @@
+sudo: unable to restore terminal settings: Illegal seek
+Sorry, try again.
+sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper
+sudo: 1 incorrect password attempt

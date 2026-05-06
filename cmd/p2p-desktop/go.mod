@@ -9,6 +9,8 @@ require (
 
 replace p2p => ../../
 
+replace github.com/wailsapp/wails/v2 => ../../third_party/wails
+
 require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
@@ -57,5 +59,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
-
-// replace github.com/wailsapp/wails/v2 v2.12.0 => /Users/hejiajun/go/pkg/mod

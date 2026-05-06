@@ -1,0 +1,14 @@
+#!/usr/bin/expect -f
+set timeout 30
+set ip "8.136.129.162"
+set user "root"
+set pass "Hjj123456"
+
+spawn ssh -o StrictHostKeyChecking=no $user@$ip
+expect "password:"
+send "$pass\r"
+expect "# "
+send "cat /etc/meshlink/data/address.txt\r"
+expect "# "
+send "exit\r"
+expect eof

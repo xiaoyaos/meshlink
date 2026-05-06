@@ -1,0 +1,31 @@
+#!/usr/bin/expect -f
+set timeout 60
+set pass "Hjj123456"
+set addr "/ip4/8.136.129.162/tcp/4001/p2p/12D3KooWLd56gZpYP2Q1hejJ2juN6GoYQcA9VMTcek6aetTRfwYi"
+set server_vip "10.98.237.157"
+
+# Start node in the background via shell and capture log
+spawn bash -c "sudo ./dist/bin/p2p-node-darwin-arm64 -port 4002 -config ./config_mac1 -bootstrap $addr > client_debug.log 2>&1"
+expect {
+    -re "Password:" {
+        send "$pass\r"
+    }
+}
+
+# Wait for node to be ready
+sleep 15
+
+# Try ping
+spawn ping -c 5 $server_vip
+expect eof
+
+# Wait a bit more for bridge logs
+sleep 5
+
+# Kill node
+exec sudo pkill -9 p2p-node
+sleep 1
+
+# Cat log
+spawn cat client_debug.log
+expect eof

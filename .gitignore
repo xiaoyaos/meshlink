@@ -24,7 +24,10 @@ p2p-gui
 # pkg/tun/wintun.dll
 
 # Build artifacts
+/dist/
 /release/
+/cmd/p2p-desktop/p2p-desktop
+/cmd/p2p-desktop/build/bin/
 
 # OS/IDE specific
 .DS_Store

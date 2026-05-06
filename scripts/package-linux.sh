@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # MeshLink — 打包 Linux 发行包脚本
-# 生成: dist/meshlink-linux-<version>.tar.gz
+# 生成: dist/packages/meshlink-linux-<version>.tar.gz
 # 包含: p2p-node-linux-amd64, p2p-node-linux-arm64, install.sh, uninstall.sh, README
 # =============================================================================
 
@@ -14,9 +14,9 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 # 脚本所在目录 = meshlink 项目根目录
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE_CLI="${ROOT_DIR}/release/cli"
+DIST_BIN="${ROOT_DIR}/dist/bin"
 SCRIPTS_DIR="${ROOT_DIR}/scripts"
-OUTPUT_DIR="${ROOT_DIR}/dist"
+OUTPUT_DIR="${ROOT_DIR}/dist/packages"
 VERSION="${1:-$(date +%Y%m%d)}"
 PKG_NAME="meshlink-linux-${VERSION}"
 PKG_DIR="${OUTPUT_DIR}/${PKG_NAME}"
@@ -29,7 +29,7 @@ echo ""
 
 # 检查 CLI 二进制是否存在
 for arch in amd64 arm64; do
-  bin="${RELEASE_CLI}/p2p-node-linux-${arch}"
+  bin="${DIST_BIN}/p2p-node-linux-${arch}"
   [[ -f "$bin" ]] || error "找不到 ${bin}，请先运行: make release-cli"
 done
 
@@ -40,8 +40,8 @@ mkdir -p "${PKG_DIR}"
 
 # 复制二进制
 info "复制 Linux 二进制 ..."
-cp "${RELEASE_CLI}/p2p-node-linux-amd64" "${PKG_DIR}/"
-cp "${RELEASE_CLI}/p2p-node-linux-arm64" "${PKG_DIR}/"
+cp "${DIST_BIN}/p2p-node-linux-amd64" "${PKG_DIR}/"
+cp "${DIST_BIN}/p2p-node-linux-arm64" "${PKG_DIR}/"
 chmod 755 "${PKG_DIR}"/p2p-node-linux-*
 
 # 复制脚本

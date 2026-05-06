@@ -169,23 +169,47 @@ success "systemd 服务配置完成"
 info "重新加载 systemd 配置 ..."
 systemctl daemon-reload
 
-# 关键：先彻底停止旧实例，防止重装时出现双进程抢占同一端口
-info "停止已有的 MeshLink 进程（如有）..."
+# 关键优化：自动搜索并停止可能冲突的旧版服务
+info "扫描并清理冲突的旧版服务 ..."
+LEGACY_SERVICES=$(grep -lE "p2p-node|meshlink" /etc/systemd/system/*.service 2>/dev/null || true)
+for svc_file in $LEGACY_SERVICES; do
+  svc_name=$(basename "$svc_file")
+  if [[ "$svc_name" != "${SERVICE_NAME}.service" ]]; then
+    warn "发现冲突服务: ${svc_name}，正在停止并禁用..."
+    systemctl stop "$svc_name" 2>/dev/null || true
+    systemctl disable "$svc_name" 2>/dev/null || true
+    # 彻底移除旧服务文件，防止它在后台偷偷重启
+    # rm -f "$svc_file" # 暂时不删除物理文件，只禁用，更安全
+  fi
+done
+
+# 停止当前服务
 systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+
+# 强力清理：不仅清理精准匹配的进程，还要通过端口号和模糊名称清理
+info "正在执行深层进程清理..."
+# 1. 尝试杀掉所有包含 p2p-node 的进程
+pkill -9 -f "p2p-node" 2>/dev/null || true
+
+# 2. 检查并杀掉占用端口的进程（终极手段）
+# 重复检查 2 次，防止某些守护进程在被杀后瞬间重启
+for i in {1..2}; do
+  PORT_PIDS=$(ss -tlnp "sport = :${PORT}" | grep -oP '(?<=pid=)\d+' | sort -u || true)
+  if [[ -n "$PORT_PIDS" ]]; then
+    warn "检测到端口 ${PORT} 被进程 ${PORT_PIDS} 占用，正在强制终止..."
+    echo "$PORT_PIDS" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+done
+
 # 等待端口完全释放，最多等 5 秒
 for i in $(seq 1 5); do
-  if ! ss -tlnp | grep -q ":${PORT} "; then
+  if ! ss -tlnp "sport = :${PORT}" | grep -q ":${PORT} "; then
     break
   fi
-  warn "端口 ${PORT} 仍被占用，等待释放... (${i}/5)"
+  warn "端口 ${PORT} 仍在等待内核释放... (${i}/5)"
   sleep 1
 done
-# 如果还有残留的游离进程（非 systemd 管理的），一并清理
-if pgrep -x "${BINARY_NAME}" > /dev/null 2>&1; then
-  warn "发现未被 systemd 管理的残留进程，正在强制终止..."
-  pkill -9 -x "${BINARY_NAME}" 2>/dev/null || true
-  sleep 1
-fi
 
 info "设置开机自启 ..."
 systemctl enable "${SERVICE_NAME}"

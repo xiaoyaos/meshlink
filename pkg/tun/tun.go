@@ -49,7 +49,7 @@ func New(ip net.IP) (*Interface, error) {
 
 func newWindows(ip net.IP) (*Interface, error) {
 	// 在 Windows 上使用 wintun
-	dev, err := tun.CreateTUN("p2p-mesh", 1500)
+	dev, err := tun.CreateTUN("p2p-mesh", 1380)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Wintun interface (is wintun.dll present?): %v", err)
 	}
@@ -76,12 +76,16 @@ func (itf *Interface) setup() error {
 
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("ifconfig", itf.Name, ipStr, ipStr, "up")
+		cmd = exec.Command("ifconfig", itf.Name, ipStr, ipStr, "mtu", "1380", "up")
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to ifconfig on darwin: %v", err)
 		}
 		cmd = exec.Command("route", "add", "-net", "10.0.0.0/8", "-interface", itf.Name)
 	case "linux":
+		cmd = exec.Command("ip", "link", "set", "dev", itf.Name, "mtu", "1380")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to set MTU on linux: %v", err)
+		}
 		cmd = exec.Command("ip", "addr", "add", ipStr+"/8", "dev", itf.Name)
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to set IP on linux: %v", err)
@@ -89,6 +93,11 @@ func (itf *Interface) setup() error {
 		cmd = exec.Command("ip", "link", "set", "dev", itf.Name, "up")
 	case "windows":
 		// Windows 使用 netsh
+		cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface", itf.Name, "mtu=1380", "store=active")
+		if err := cmd.Run(); err != nil {
+			// 如果失败可能是接口名不匹配或权限问题，继续尝试设置 IP
+			fmt.Printf("[tun] warning: failed to set MTU on windows: %v\n", err)
+		}
 		cmd = exec.Command("netsh", "interface", "ip", "set", "address",
 			"name="+itf.Name, "source=static", "addr="+ipStr, "mask=255.0.0.0", "gateway=none")
 	default:

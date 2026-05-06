@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"p2p/pkg/identity"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"p2p/pkg/identity"
 )
 
 type State int
@@ -37,7 +37,8 @@ type VPNService struct {
 	peerID    peer.ID
 	virtualIP string
 
-	cmd *exec.Cmd
+	cmd        *exec.Cmd
+	daemonName string
 
 	OnLog   func(string)
 	OnState func(State)
@@ -56,7 +57,10 @@ func (s *VPNService) SetRelay(enable bool) {
 }
 
 func (s *VPNService) logf(format string, v ...interface{}) {
-	msg := fmt.Sprintf(format, v...)
+	msg := sanitizeLogMessage(fmt.Sprintf(format, v...))
+	if msg == "" {
+		return
+	}
 	if s.OnLog != nil {
 		s.OnLog(msg)
 	}
@@ -70,14 +74,25 @@ func (s *VPNService) setState(st State) {
 	}
 }
 
-func (s *VPNService) GetInfo() (string, string) {
-	if s.peerID == "" {
-		priv, _ := identity.LoadOrGenerateKey(s.configDir)
-		id, ip, _ := identity.GetPeerInfo(priv)
-		s.peerID = id
-		s.virtualIP = ip.String()
+func (s *VPNService) GetInfo() (string, string, error) {
+	if s.peerID != "" && s.virtualIP != "" {
+		return s.peerID.String(), s.virtualIP, nil
 	}
-	return s.peerID.String(), s.virtualIP
+
+	priv, err := identity.LoadOrGenerateKey(s.configDir)
+	if err != nil {
+		return "", "", err
+	}
+
+	id, ip, err := identity.GetPeerInfo(priv)
+	if err != nil {
+		return "", "", err
+	}
+
+	s.priv = priv
+	s.peerID = id
+	s.virtualIP = ip.String()
+	return s.peerID.String(), s.virtualIP, nil
 }
 
 // findNodeBinary locates the p2p-node CLI executable
@@ -117,15 +132,15 @@ func findNodeBinary() (string, error) {
 		}
 	}
 
-	// 3. 开发环境寻找 ../../release/cli
-	path = filepath.Join(dir, "..", "..", "release", "cli", binName)
+	// 3. 开发环境寻找 ../../dist/bin
+	path = filepath.Join(dir, "..", "..", "dist", "bin", binName)
 	if _, err := os.Stat(path); err == nil {
 		return path, nil
 	}
 
-	// 4. 当前工作目录下的 release/cli
+	// 4. 当前工作目录下的 dist/bin
 	cwd, _ := os.Getwd()
-	path = filepath.Join(cwd, "release", "cli", binName)
+	path = filepath.Join(cwd, "dist", "bin", binName)
 	if _, err := os.Stat(path); err == nil {
 		return path, nil
 	}
@@ -137,58 +152,81 @@ func (s *VPNService) Start(bootstrapAddr string) error {
 	s.Lock()
 	defer s.Unlock()
 
-	if s.state != StateDisconnected {
+	if s.state == StateConnecting || s.state == StateConnected {
 		return fmt.Errorf("already running or connecting")
 	}
+	s.cmd = nil
+	s.daemonName = ""
 
 	s.setState(StateConnecting)
-	s.logf("Starting P2P VPN service daemon...")
+	s.logf("正在启动 P2P VPN 服务...")
 
-	s.GetInfo() // Ensure config and keys exist
+	if _, _, err := s.GetInfo(); err != nil {
+		s.setState(StateError)
+		return fmt.Errorf("failed to load node identity: %v", err)
+	}
+
+	if err := os.MkdirAll(s.configDir, 0700); err != nil {
+		s.setState(StateError)
+		return fmt.Errorf("failed to create config dir: %v", err)
+	}
 
 	binPath, err := findNodeBinary()
 	if err != nil {
 		s.setState(StateError)
 		return err
 	}
+	s.daemonName = filepath.Base(binPath)
 
-	args := []string{"-port", s.port, "-config", s.configDir}
+	args := []string{"-port", s.port, "-config", s.configDir, "-parent-pid", fmt.Sprintf("%d", os.Getpid())}
 	if bootstrapAddr != "" {
 		args = append(args, "-bootstrap", bootstrapAddr)
 	}
 
 	var cmd *exec.Cmd
+	logPath := filepath.Join(s.configDir, "daemon.log")
 
 	if runtime.GOOS == "windows" {
 		// Windows: 需要提权启动 CLI 以创建 TUN 网卡
 		// 因为 GUI 目前是非管理员运行，我们通过 PowerShell 的 RunAs 动词来启动 CLI。
 		// 为了捕获输出，我们将 CLI 的输出重定向到临时文件，由 GUI 轮询读取。
-		logPath := filepath.Join(s.configDir, "daemon.log")
 		os.Remove(logPath) // 清理旧日志
 
 		// 使用 CLI 新增的 -logfile 参数，这样就不需要复杂的 shell 重定向了
 		winArgs := append(args, "-logfile", logPath)
-		cliArgs := strings.Join(winArgs, " ")
-		
+		cliArgs := windowsArgumentList(winArgs)
+
 		s.logf("Windows: 正在尝试以管理员权限启动 P2P 核心...")
 		// 使用单引号包裹路径以处理空格
 		powershellCmd := fmt.Sprintf("Start-Process '%s' -ArgumentList '%s' -Verb RunAs -WindowStyle Hidden", binPath, cliArgs)
 		cmd = exec.Command("powershell", "-Command", powershellCmd)
-		
+
 		if err := cmd.Run(); err != nil {
 			s.setState(StateError)
 			return fmt.Errorf("无法发起提权请求 (用户可能点击了取消): %v", err)
 		}
 
 		// 启动一个虚拟进程用于维持生命周期管理
-		s.cmd = exec.Command("cmd", "/c", "echo elevated") 
-		go s.tailWindowsLog(logPath)
+		s.cmd = exec.Command(binPath)
+		go s.tailDaemonLog(logPath)
 		return nil
 	} else if runtime.GOOS == "darwin" {
-		// macOS: use osascript to elevate ONLY the CLI and capture stdout
-		cliCmd := fmt.Sprintf("'%s' %s", binPath, strings.Join(args, " "))
-		script := fmt.Sprintf(`do shell script "%s" with administrator privileges`, cliCmd)
+		os.Remove(logPath)
+
+		daemonArgs := append(args, "-logfile", logPath)
+		cliCmd := "nohup " + shellCommand(binPath, daemonArgs) + " >/dev/null 2>&1 &"
+		script := fmt.Sprintf("do shell script %q with administrator privileges", cliCmd)
+
+		s.logf("macOS: 正在请求管理员权限启动 P2P 核心...")
 		cmd = exec.Command("osascript", "-e", script)
+		if err := cmd.Run(); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("无法发起提权请求 (用户可能点击了取消): %v", err)
+		}
+
+		s.cmd = exec.Command(binPath)
+		go s.tailDaemonLog(logPath)
+		return nil
 	} else {
 		// Linux: use pkexec
 		cmd = exec.Command("pkexec", append([]string{binPath}, args...)...)
@@ -208,27 +246,19 @@ func (s *VPNService) Start(bootstrapAddr string) error {
 	// Async output reader and state manager
 	go func() {
 		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
-			s.logf("[Daemon] %s", line)
-
-			if strings.Contains(line, "[STATE] CONNECTED") || strings.Contains(line, "Network is ready") {
-				if s.state != StateConnected {
-					s.setState(StateConnected)
-					s.logf("VPN Connected successfully.")
-				}
-			} else if strings.Contains(line, "[STATE] ERROR") || strings.Contains(line, "FAILED to connect") || strings.Contains(line, "bootstrap failed") {
-				s.setState(StateError)
-				s.logf("VPN Connection Error!")
-			}
+			s.handleDaemonLogLine(line)
 		}
 
 		cmd.Wait()
 		s.Lock()
 		s.cmd = nil
+		s.daemonName = ""
 		s.setState(StateDisconnected)
 		s.Unlock()
-		s.logf("Daemon process exited.")
+		s.logf("VPN 进程已退出。")
 	}()
 
 	return nil
@@ -238,30 +268,35 @@ func (s *VPNService) Stop() {
 	s.Lock()
 	defer s.Unlock()
 
-	if s.cmd != nil {
-		if runtime.GOOS == "windows" {
-			// Windows: 因为是通过 Start-Process 提权启动的，s.cmd 只是个占位符
-			// 我们需要按名称杀掉真正的进程
-			exec.Command("taskkill", "/F", "/IM", "p2p-node-windows-amd64.exe").Run()
-			s.cmd.Process.Kill()
-		} else if runtime.GOOS == "darwin" {
-			// osascript runs child as root, so killing osascript might not kill the child
-			// We kill by binary name for safety
-			exec.Command("sudo", "killall", filepath.Base(s.cmd.Path)).Run()
-			s.cmd.Process.Kill()
-		} else {
-			exec.Command("sudo", "killall", filepath.Base(s.cmd.Path)).Run()
-			s.cmd.Process.Kill()
-		}
-		s.cmd = nil
+	daemonName := s.daemonName
+	if daemonName == "" && s.cmd != nil {
+		daemonName = filepath.Base(s.cmd.Path)
 	}
+
+	if daemonName != "" {
+		if runtime.GOOS == "windows" {
+			// Windows: 因为是通过 Start-Process 提权启动的，s.cmd 只是个占位符。
+			exec.Command("taskkill", "/F", "/IM", daemonName).Run()
+		} else if runtime.GOOS == "darwin" {
+			killCmd := "killall " + shellQuote(daemonName)
+			script := fmt.Sprintf("do shell script %q with administrator privileges", killCmd)
+			exec.Command("osascript", "-e", script).Run()
+		} else {
+			exec.Command("sudo", "killall", daemonName).Run()
+		}
+	}
+	if s.cmd != nil && s.cmd.Process != nil {
+		s.cmd.Process.Kill()
+	}
+	s.cmd = nil
+	s.daemonName = ""
 	s.setState(StateDisconnected)
-	s.logf("VPN Stopped.")
+	s.logf("VPN 已停止。")
 }
 
-// tailWindowsLog 专门用于 Windows 下读取重定向到文件的日志
-func (s *VPNService) tailWindowsLog(path string) {
-	s.logf("开始轮询读取日志文件: %s", path)
+// tailDaemonLog 读取提权后的守护进程日志，避免桌面端直接接管长期 stdout。
+func (s *VPNService) tailDaemonLog(path string) {
+	s.logf("日志文件: %s", path)
 	// 等待文件创建
 	for i := 0; i < 20; i++ {
 		if _, err := os.Stat(path); err == nil {
@@ -273,6 +308,7 @@ func (s *VPNService) tailWindowsLog(path string) {
 	file, err := os.Open(path)
 	if err != nil {
 		s.logf("无法打开日志文件: %v", err)
+		s.setState(StateError)
 		return
 	}
 	defer file.Close()
@@ -280,32 +316,118 @@ func (s *VPNService) tailWindowsLog(path string) {
 	reader := bufio.NewReader(file)
 	for {
 		line, err := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line != "" {
+			s.handleDaemonLogLine(line)
+		}
+
 		if err != nil {
-			// 如果读到末尾，稍等一下继续读
 			time.Sleep(500 * time.Millisecond)
 			s.Lock()
-			running := s.state != StateDisconnected
+			running := s.state == StateConnecting || s.state == StateConnected
 			s.Unlock()
 			if !running {
 				break
 			}
-			continue
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		s.logf("[Daemon] %s", line)
-
-		if strings.Contains(line, "[STATE] CONNECTED") || strings.Contains(line, "Network is ready") {
-			if s.state != StateConnected {
-				s.setState(StateConnected)
-				s.logf("VPN 连接成功 (Windows 提权模式).")
-			}
-		} else if strings.Contains(line, "[STATE] ERROR") || strings.Contains(line, "FAILED") {
-			s.setState(StateError)
 		}
 	}
+}
+
+func (s *VPNService) handleDaemonLogLine(line string) {
+	s.logf("[daemon] %s", line)
+
+	if isDaemonReady(line) {
+		if s.state != StateConnected {
+			s.setState(StateConnected)
+			s.logf("VPN 已连接。")
+		}
+		return
+	}
+
+	if isDaemonFatal(line) {
+		s.setState(StateError)
+		s.logf("VPN 启动失败，请检查权限、端口和引导节点。")
+	}
+}
+
+func isDaemonReady(line string) bool {
+	return strings.Contains(line, "[ready]") ||
+		strings.Contains(line, "[STATE] CONNECTED") ||
+		strings.Contains(line, "Network is ready")
+}
+
+func isDaemonFatal(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(line, "[fatal]") ||
+		strings.Contains(line, "[STATE] ERROR") ||
+		strings.Contains(line, "致命错误") ||
+		strings.Contains(lower, "fatal") ||
+		strings.Contains(lower, "bootstrap failed") ||
+		strings.Contains(lower, "failed to load identity") ||
+		strings.Contains(lower, "failed to get peer info")
+}
+
+func shellCommand(binPath string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellQuote(binPath))
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func windowsArgumentList(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, windowsArgQuote(arg))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func windowsArgQuote(s string) string {
+	if s == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(s, " \t\"") {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+func sanitizeLogMessage(msg string) string {
+	const maxRunes = 2000
+
+	var b strings.Builder
+	b.Grow(len(msg))
+	written := 0
+	truncated := false
+
+	for _, r := range msg {
+		if written >= maxRunes {
+			truncated = true
+			break
+		}
+
+		switch {
+		case r == '\n' || r == '\r':
+			b.WriteByte(' ')
+		case r == '\t':
+			b.WriteRune(r)
+		case r < 0x20 || r == 0x7f:
+			continue
+		default:
+			b.WriteRune(r)
+		}
+		written++
+	}
+
+	out := strings.TrimSpace(b.String())
+	if truncated {
+		out += " ...[truncated]"
+	}
+	return out
 }

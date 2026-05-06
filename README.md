@@ -1,195 +1,202 @@
-# P2P 虚拟网状网络 (P2P Virtual Mesh Network)
+# MeshLink P2P 虚拟网状网络
 
-基于 Go 语言和 libp2p 构建的跨地域、跨内网纯点对点虚拟局域网。无需公网中转服务器，客户端加入网络后即可获得唯一的 `10.x.x.x` 虚拟 IP 并直接互访。
+MeshLink 是基于 Go 和 libp2p 的跨平台虚拟局域网。每个节点会获得一个稳定的 `10.x.x.x` 虚拟 IP；公网节点负责节点发现、DHT 路由及 NAT 打洞辅助，数据传输优先通过 P2P 直连，并支持中继回退。
 
----
+## 架构
 
-## 🏗 架构说明
-
+```text
+  [ 用户应用 / 操作系统 ]            [ 用户应用 / 操作系统 ]
+          |                              |
+  [ TUN 网卡 (MTU 1380) ]        [ TUN 网卡 (MTU 1380) ]
+          |                              |
+  [ 网桥 (Worker Pool 并发控制) ]  [ 网桥 (Worker Pool 并发控制) ]
+          |                              |
+          +-------- 持久化长连接流 (Length-Prefixed Framing) --------+
+          |           (优先直连打洞，自动回退到 Relay 中继)            |
+          v                                                      v
+  [ libp2p 节点 ] <------- DHT / 引导 / 打洞控制 -------> [ libp2p 节点 ]
+                                 |
+                        [ 公网引导节点 (Relay/DHT) ]
 ```
-[内网 Mac 客户端]  <──── 打洞/中继 ────>  [内网 Windows 客户端]
-         │                                        │
-         └──────────────── DHT 发现 ──────────────┘
-                                │
-                   [公网引导/中继节点（任意平台）]
+
+- **TUN 接口**：统一 MTU 为 1380，预留封装空间，防止 IP 分片。
+- **网桥层**：引入工作线程池（Worker Pool）处理 TUN 数据包，防止高负载下协程爆炸。
+- **数据面**：采用**持久化长连接流**代替“每包一流”，并使用 4 字节长度前缀进行帧包装，极大提升吞吐量。
+- **连接策略**：优先尝试打洞建立直连隧道（Direct）；若 NAT 打洞失败，将自动降级通过 Relay 中继通信，确保连接不中断。
+
+## 需要更新哪些端
+
+这次架构重构（持久化流与帧包装）引入了破坏性协议变更：
+
+- **所有节点必须同步更新**：旧版本（每包一流）无法与新版本（持久化流）互通。
+- **引导节点**：建议同步更新，以支持最新的连接协商逻辑。
+
+
+## 为什么客户端也要监听端口
+
+客户端监听端口是 P2P 直连的必要条件，不代表让公网服务器中继业务流量。
+
+- 另一个客户端要连进来时，本机必须有 socket 在等待连接。
+- NAT 打洞需要稳定的本地 TCP/UDP 端口，双方通过公网节点交换观察到的地址后同时尝试连接。
+- libp2p 需要把本机可用地址发布到 DHT，其他客户端才能发现并尝试直连。
+
+默认监听：
+
+```text
+/ip4/0.0.0.0/tcp/<port>
+/ip4/0.0.0.0/udp/<port>/quic-v1
 ```
 
-- **引导节点**（`p2p-node`）：运行在具有公网 IP 的服务器上，帮助客户端互相发现。支持 Linux / macOS / Windows，**任意平台均可作为引导节点，客户端行为完全一致**。
-- **客户端**（`p2p-gui`）：Mac 或 Windows 桌面端，双击运行，自动获得虚拟 IP。
+同一台机器运行多个客户端时端口不能重复；不同机器可以使用相同端口。公网服务器需要开放对应 TCP/UDP 端口，普通客户端通常不需要手工做端口映射，但本机防火墙不能阻止程序监听和出站连接。
 
----
+## 快速启动
 
-## 🚀 快速开始
-
-### 第一步：在公网服务器部署引导节点
-
-下载对应平台的 `p2p-node` 二进制，在服务器上执行：
+### 公网引导节点
 
 ```bash
-# Linux（推荐）
 sudo ./p2p-node-linux-amd64 -port 4001 -relay -config ./server_config
+```
 
-# macOS
-sudo ./p2p-node-darwin-arm64 -port 4001 -relay -config ./server_config
+Windows 管理员命令提示符：
 
-# Windows（管理员命令提示符）
+```powershell
 p2p-node-windows-amd64.exe -port 4001 -relay -config .\server_config
 ```
 
-启动后，记录日志中输出的 **Multiaddr 地址**，格式如：
-```
+启动后记录 `address.txt` 或日志中的公网 Multiaddr：
+
+```text
 /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
 ```
 
-### 第二步：客户端加入网络
+### 客户端
 
-#### macOS 客户端
-1. 双击打开 `p2p-gui-macos.app`
-2. 系统会弹出**密码框**，输入开机密码授予管理员权限
-3. 在 "引导节点地址" 输入框中填入第一步的 Multiaddr 地址
-4. 点击 **启动网络**，等待状态变为 **已连接**
-5. 您的虚拟 IP（`10.x.x.x`）会显示在界面上
+CLI：
 
-#### Windows 客户端
-1. 运行 `p2p-gui-windows-setup.exe` 进行安装（**wintun 驱动已内置，无需单独安装**）
-2. 程序启动时会弹出 **UAC 管理员权限请求**，点击"是"
-3. 在 "引导节点地址" 输入框中填入第一步的 Multiaddr 地址
-4. 点击 **启动网络**，等待状态变为 **已连接**
+```bash
+sudo ./p2p-node-linux-amd64 -port 4002 -config ./client_config -bootstrap "/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW..."
+```
 
-> 两台不同内网的客户端，连接同一个引导节点后，即可通过 `ping 10.x.x.x` 互相通信。
+桌面端：
 
----
+1. 启动 macOS 或 Windows GUI。
+2. 填入公网引导节点 Multiaddr。
+3. 点击启动网络。
+4. 使用界面显示的 `10.x.x.x` 虚拟 IP 互访。
 
-## 💻 平台支持
+## 日志判断
+
+客户端正常应看到：
+
+```text
+[dht] mode=auto
+[relay] candidates=1 usage=hole-punch-control
+[advertise] ready ip=... direct_addrs=... relay_addrs=...
+[route] candidate ip=... direct_addrs=... relay_addrs=...
+[tunnel] hole punch start ...
+[tunnel] direct ready ...
+[route] direct ready ...
+```
+
+公网引导节点正常应看到：
+
+```text
+[dht] mode=server
+[relay] service enabled
+```
+
+如果客户端长期 `relay_addrs=0`，说明还没有拿到可用于打洞的 relay 地址；如果有 `relay_addrs>0` 但最终报 `hole punch did not produce a direct tunnel`，说明当前 NAT 组合没有打通 direct 连接。按当前策略，业务流量不会降级走公网节点中继。
+
+## Linux 服务端安装包
+
+生成生产包：
+
+```bash
+make package-linux VERSION=1.0.0
+```
+
+产物：
+
+```text
+dist/packages/meshlink-linux-1.0.0.tar.gz
+```
+
+服务器安装：
+
+```bash
+scp dist/packages/meshlink-linux-1.0.0.tar.gz root@1.2.3.4:/tmp/
+ssh root@1.2.3.4
+cd /tmp
+tar xzf meshlink-linux-1.0.0.tar.gz
+cd meshlink-linux-1.0.0
+sudo bash install.sh --relay --port 4001
+```
+
+常用命令：
+
+```bash
+meshlink status
+meshlink logs
+meshlink restart
+meshlink address
+meshlink stop
+```
+
+## 生产构建目录规范
+
+生产产物统一输出到根目录 `dist/`，不要放在 `cmd/`、`pkg/` 或源码目录中。
+
+```text
+dist/
+  bin/          # p2p-node 跨平台 CLI 二进制
+  apps/         # 桌面应用或便携目录
+  packages/     # 可发布安装包、tar.gz、zip
+```
+
+标准构建命令：
+
+```bash
+make release-cli              # 生成 dist/bin/*
+make release-gui              # macOS 本机构建 dist/apps/p2p-gui-macos.app
+make docker-builder           # 首次构建 Windows Docker builder
+make release-gui-windows      # 生成 dist/apps/windows-amd64/
+make package-linux VERSION=1.0.0
+make verify
+```
+
+完整构建：
+
+```bash
+make dist VERSION=1.0.0
+```
+
+说明：
+
+- `dist/bin/p2p-node-*` 是服务端和桌面端内置后台程序的标准来源。
+- macOS `.app` 内会复制对应架构的 `p2p-node-darwin-*`。
+- Windows 便携目录会包含 `p2p-gui-windows-amd64.exe`、`p2p-node-windows-amd64.exe` 和 `wintun.dll`。
+- `release/` 已不再作为生产输出目录。
+
+## 平台说明
 
 | 组件 | macOS | Linux | Windows |
-|------|-------|-------|---------|
-| 引导/中继节点（`p2p-node`）| ✅ arm64 / amd64 | ✅ amd64 / arm64 | ✅ amd64 |
-| 桌面客户端（`p2p-gui`）| ✅ Universal | ❌（使用 CLI） | ✅ amd64（含 Wintun 驱动）|
+| --- | --- | --- | --- |
+| `p2p-node` CLI | arm64 / amd64 | amd64 / arm64 | amd64 |
+| 桌面 GUI | Universal | 使用 CLI | amd64 |
 
-### Windows 特别说明
-- **Wintun 驱动已内置**：无需访问 wintun.net 下载，程序首次运行时会自动释放驱动文件。
-- **UAC 自动弹出**：程序检测到非管理员权限时，会自动触发 Windows 的 UAC 弹窗，点击"是"即可，无需手动"以管理员身份运行"。
-- **系统要求**：Windows 10 1903+ / Windows 11。
+Windows：
 
-### macOS 特别说明
-- 启动时会弹出系统密码框，输入开机密码即可。
-- 程序会自动添加 `10.0.0.0/8` 路由到虚拟网卡。
-- 配置文件存储在 `~/Library/Application Support/P2PMesh/`。
+- Wintun 驱动已嵌入 CLI，运行时释放到可执行文件同级目录。
+- 需要管理员权限创建虚拟网卡。
 
----
+macOS：
 
-## 🛠 进阶：Linux 服务器一键部署
+- 需要管理员权限创建 TUN 和添加路由。
+- 配置默认存储在 `~/Library/Application Support/P2PMesh/`。
 
-如果你需要在公网 Linux 服务器上长期运行**引导节点**，我们提供了一键安装和打包脚本。
+## 排查
 
-### 1. 获取安装包
-
-你可以从 [Releases](../../releases) 页面下载 `meshlink-linux-<version>.tar.gz`，或者自己编译打包：
-
-```bash
-# 在含有 Makefile 的源码目录运行
-make package-linux VERSION=1.0.0
-```
-产物在 `dist/meshlink-linux-1.0.0.tar.gz`。
-
-### 2. 上传并解压
-
-```bash
-# 传到服务器（将 1.2.3.4 替换为你的服务器 IP）
-scp dist/meshlink-linux-1.0.0.tar.gz root@1.2.3.4:/tmp/
-
-# 在服务器上解压
-cd /tmp && tar xzf meshlink-linux-1.0.0.tar.gz && cd meshlink-linux-1.0.0
-```
-
-### 3. 一键安装并运行
-
-```bash
-# 一键安装，开启中继模式，端口 4001
-sudo bash install.sh --relay
-
-# 或者自定义端口
-sudo bash install.sh --relay --port 5001
-```
-
-安装脚本会自动将节点注册为 `systemd` 服务，并设置开机自启。
-
-### 4. 获取节点地址
-
-节点启动后，它的 `Multiaddr`（供客户端连接时填入）会自动保存在配置文件中：
-
-```bash
-cat /etc/meshlink/data/address.txt
-```
-输出示例：
-```text
-Virtual IP: 10.1.179.163
-
-Multiaddr:
-/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
-/ip4/127.0.0.1/tcp/4001/p2p/12D3KooW...
-```
-
-### 常用管理命令
-
-安装成功后，系统已自动注册全局 `meshlink` 命令，随时随地可用：
-
-```bash
-meshlink status          # 查看服务运行状态
-meshlink logs            # 实时查看节点日志
-meshlink restart         # 重启节点服务
-meshlink address         # 直接打印本节点的 Multiaddr 地址
-meshlink start           # 启动服务
-meshlink stop            # 停止服务
-
-nano /etc/meshlink/meshlink.env    # 修改端口或配置参数（修改后需 restart）
-```
-
-### 卸载节点
-
-```bash
-sudo bash uninstall.sh             # 卸载服务（保留配置和密钥）
-sudo bash uninstall.sh --purge     # 彻底清除（包含身份密钥，不可恢复）
-```
-
----
-
-## 🔍 常见问题排查
-
-### Q1: 连接成功但 Ping 不通对方？
-- **防火墙**：确保两端没有拦截 ICMP 协议。如果是自建的 Linux 节点，确保开放了对应的 TCP/UDP 端口（如：`sudo ufw allow 4001`）。
-- **路由冲突**：确保物理网段不是 `10.x.x.x`。
-- **DHT 延迟**：首次连接后，DHT 寻址可能需要 10-30 秒，请稍等。
-
-### Q2: 报错 "failed to find any peer in table"？
-- 正常现象，说明当前只有您一个节点。待其他节点加入后自动消失。
-
-### Q3: Windows 弹出 UAC 后立即关闭？
-- 确保点击了"是"而非"否"。如果多次弹出，说明程序在循环提权——可以尝试右键 → 以管理员身份运行。
-
-### Q4: 端口冲突？
-- 使用 `-port` 参数更改，例如 `-port 5001`，并确保防火墙开放对应端口的 TCP 和 UDP 流量。
-
----
-
-## 📦 构建说明（开发者）
-
-```bash
-# 编译全平台 CLI 引导节点（可在 macOS 上交叉编译）
-make release-cli
-
-# 编译 macOS GUI（在 macOS 上运行）
-make release-gui
-
-# 编译 Windows GUI（通过 Docker 交叉编译，需先运行 make docker-builder）
-make release-gui-windows
-
-# 打包 Linux 服务端发行包
-make package-linux VERSION=1.0.0
-
-# 一键编译所有产物
-make dist
-```
-
-产物位置：`release/` 和 `dist/` 目录。
+- 连接公网节点正常但客户端不通：看客户端是否出现 `[tunnel] direct ready`。
+- DHT 找不到对端：确认两个客户端填的是同一个公网节点 Multiaddr，并等待首次 `[advertise] ready`。
+- 端口冲突：换 `-port`，同机多个实例不能共用端口。
+- 物理网段冲突：避免本地真实网络也使用 `10.0.0.0/8`。

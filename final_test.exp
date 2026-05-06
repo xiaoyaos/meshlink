@@ -1,0 +1,38 @@
+#!/usr/bin/expect -f
+set timeout 120
+set pass "Hjj123456"
+set addr "/ip4/8.136.129.162/tcp/4001/p2p/12D3KooWLd56gZpYP2Q1hejJ2juN6GoYQcA9VMTcek6aetTRfwYi"
+set server_vip "10.98.237.157"
+
+spawn sudo ./dist/bin/p2p-node-darwin-arm64 -port 4002 -config ./config_mac1 -bootstrap $addr
+expect {
+    -re "Password:" {
+        send "$pass\r"
+        exp_continue
+    }
+    "检测到当前未以管理员/Root 权限运行" {
+        exp_continue
+    }
+    "meshlink is running" {
+        puts "\n[SUCCESS] CLIENT_RUNNING\n"
+    }
+}
+
+# Wait for DHT stabilization
+sleep 15
+
+# Perform Ping
+puts "\n[TEST] PINGING SERVER VIP $server_vip\n"
+spawn ping -c 5 $server_vip
+expect {
+    "5 packets transmitted, 5 packets received" {
+        puts "\n[SUCCESS] PING_PASSED\n"
+    }
+    timeout {
+        puts "\n[FAILURE] PING_TIMEOUT\n"
+    }
+}
+
+# Keep process alive for manual inspection if needed, or kill
+exec sudo pkill p2p-node
+exit 0

@@ -1,50 +1,52 @@
-# P2P Virtual Mesh Network Makefile
-BINARY_NAME=p2p-gui
-CLI_NAME=p2p-node
-DIST_DIR=release
-VERSION=1.0.0
+# MeshLink production build targets
 
-.PHONY: all clean dist release-cli release-gui release-gui-windows docker-builder package-linux
+BINARY_NAME := p2p-gui
+CLI_NAME := p2p-node
+DIST_DIR := dist
+BIN_DIR := $(DIST_DIR)/bin
+APP_DIR := $(DIST_DIR)/apps
+PKG_DIR := $(DIST_DIR)/packages
+VERSION ?= 1.0.0
+GO_LDFLAGS := -s -w
+
+.PHONY: all clean dist release-cli release-gui release-gui-windows docker-builder package-linux verify
 
 all: dist
 
-# --- 核心发布任务 ---
-# 注意: release-gui 需要在对应平台上运行（macOS 编 .app，Windows 编 .exe）
-# 全平台自动化请使用 GitHub Actions: .github/workflows/release.yml
-dist: clean release-cli release-gui release-gui-windows
+# Full production build. GUI targets still require platform-specific toolchains.
+dist: clean release-cli release-gui release-gui-windows package-linux
 
-# --- 编译 CLI 引导/中继节点（无 CGO，支持全平台交叉编译）---
+# Build CLI nodes. These binaries are used by servers and bundled by desktop apps.
 release-cli:
-	@mkdir -p $(DIST_DIR)/cli
-	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o $(DIST_DIR)/cli/$(CLI_NAME)-darwin-arm64  ./cmd/p2p
-	CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -ldflags="-s -w" -o $(DIST_DIR)/cli/$(CLI_NAME)-darwin-amd64  ./cmd/p2p
-	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o $(DIST_DIR)/cli/$(CLI_NAME)-linux-amd64   ./cmd/p2p
-	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -ldflags="-s -w" -o $(DIST_DIR)/cli/$(CLI_NAME)-linux-arm64   ./cmd/p2p
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o $(DIST_DIR)/cli/$(CLI_NAME)-windows-amd64.exe ./cmd/p2p
-	@echo "✅ CLI binaries ready in $(DIST_DIR)/cli/"
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(CLI_NAME)-darwin-arm64  ./cmd/p2p
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(CLI_NAME)-darwin-amd64  ./cmd/p2p
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(CLI_NAME)-linux-amd64   ./cmd/p2p
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(CLI_NAME)-linux-arm64   ./cmd/p2p
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(CLI_NAME)-windows-amd64.exe ./cmd/p2p
+	@echo "CLI binaries ready in $(BIN_DIR)/"
 
-# --- 编译 GUI 桌面端（需要在目标平台本机运行）---
-release-gui:
-	@mkdir -p $(DIST_DIR)/gui
+# Build macOS GUI. Run this on macOS with Wails installed.
+release-gui: release-cli
+	@mkdir -p $(APP_DIR)
 	@rm -rf cmd/p2p-desktop/frontend/node_modules
 	@mkdir -p cmd/p2p-desktop/frontend/dist
 	@touch cmd/p2p-desktop/frontend/dist/.gitkeep
-	cd cmd/p2p-desktop && wails build -platform darwin/universal -ldflags="-s -w"
-	rm -rf $(DIST_DIR)/gui/$(BINARY_NAME)-macos.app
-	mv cmd/p2p-desktop/build/bin/p2p-desktop.app $(DIST_DIR)/gui/$(BINARY_NAME)-macos.app
-	@echo "Bundling CLI nodes into macOS App..."
-	cp $(DIST_DIR)/cli/$(CLI_NAME)-darwin-arm64 $(DIST_DIR)/gui/$(BINARY_NAME)-macos.app/Contents/MacOS/
-	cp $(DIST_DIR)/cli/$(CLI_NAME)-darwin-amd64 $(DIST_DIR)/gui/$(BINARY_NAME)-macos.app/Contents/MacOS/
-	@echo "✅ macOS GUI ready: $(DIST_DIR)/gui/$(BINARY_NAME)-macos.app"
+	cd cmd/p2p-desktop && wails build -platform darwin/universal -ldflags="$(GO_LDFLAGS)"
+	rm -rf $(APP_DIR)/$(BINARY_NAME)-macos.app
+	mv cmd/p2p-desktop/build/bin/p2p-desktop.app $(APP_DIR)/$(BINARY_NAME)-macos.app
+	cp $(BIN_DIR)/$(CLI_NAME)-darwin-arm64 $(APP_DIR)/$(BINARY_NAME)-macos.app/Contents/MacOS/
+	cp $(BIN_DIR)/$(CLI_NAME)-darwin-amd64 $(APP_DIR)/$(BINARY_NAME)-macos.app/Contents/MacOS/
+	@echo "macOS GUI ready: $(APP_DIR)/$(BINARY_NAME)-macos.app"
 
-# --- Windows GUI：通过 Docker + mingw-w64 在 macOS 上交叉编译 ---
-# 首次运行需先构建 Docker 镜像: make docker-builder
+# Build Docker image used to cross-compile the Windows GUI on macOS/Linux.
 docker-builder:
 	docker build -f Dockerfile.windows-build -t meshlink-win-builder .
-	@echo "✅ Windows builder image ready"
+	@echo "Windows builder image ready"
 
-release-gui-windows:
-	@mkdir -p $(DIST_DIR)/gui
+# Build Windows portable GUI bundle. Run docker-builder once before this target.
+release-gui-windows: release-cli
+	@mkdir -p $(APP_DIR)/windows-amd64
 	docker run --rm \
 		-v "$(PWD)":/workspace \
 		-w /workspace/cmd/p2p-desktop \
@@ -52,17 +54,22 @@ release-gui-windows:
 		-e CC=x86_64-w64-mingw32-gcc \
 		-e CXX=x86_64-w64-mingw32-g++ \
 		meshlink-win-builder \
-		sh -c "cd frontend && rm -rf node_modules dist && npm ci && npm run build && cd .. && wails build -platform windows/amd64 -ldflags='-s -w' -skipbindings -s"
-	cp cmd/p2p-desktop/build/bin/p2p-desktop.exe $(DIST_DIR)/gui/$(BINARY_NAME)-windows-amd64.exe
-	@echo "Bundling CLI node and wintun.dll for Windows..."
-	cp $(DIST_DIR)/cli/$(CLI_NAME)-windows-amd64.exe $(DIST_DIR)/gui/
-	cp pkg/tun/wintun.dll $(DIST_DIR)/gui/
-	@echo "✅ Windows GUI ready: $(DIST_DIR)/gui/$(BINARY_NAME)-windows-amd64.exe"
+		sh -c "cd frontend && rm -rf node_modules dist && npm ci && npm run build && cd .. && wails build -platform windows/amd64 -ldflags='$(GO_LDFLAGS)' -skipbindings -s"
+	cp cmd/p2p-desktop/build/bin/p2p-desktop.exe $(APP_DIR)/windows-amd64/$(BINARY_NAME)-windows-amd64.exe
+	cp $(BIN_DIR)/$(CLI_NAME)-windows-amd64.exe $(APP_DIR)/windows-amd64/
+	cp pkg/tun/wintun.dll $(APP_DIR)/windows-amd64/
+	@echo "Windows GUI bundle ready: $(APP_DIR)/windows-amd64/"
 
-# --- 打包 Linux 发行包（二进制 + 安装脚本）---
-package-linux:
+# Build Linux installer archive under dist/packages/.
+package-linux: release-cli
 	@bash scripts/package-linux.sh $(VERSION)
+
+verify:
+	go test ./cmd/... ./pkg/...
+	go build ./cmd/p2p ./cmd/diag ./pkg/...
+	go vet ./cmd/... ./pkg/...
 
 clean:
 	rm -rf $(DIST_DIR)
-	@echo "Cleaned."
+	rm -rf cmd/p2p-desktop/build/bin
+	@echo "Cleaned production build output."

@@ -51,6 +51,13 @@ if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
   success "服务已停止"
 fi
 
+# 额外的安全措施：清理可能残留的进程（如手动启动或 GUI 留下的）
+if pgrep -x "${BINARY_NAME}" > /dev/null; then
+  info "检测到残留的核心进程，正在清理..."
+  pkill -9 -x "${BINARY_NAME}" || true
+  success "残留进程已清理"
+fi
+
 if systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
   info "禁用开机自启 ..."
   systemctl disable "${SERVICE_NAME}"

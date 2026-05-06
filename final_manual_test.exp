@@ -1,0 +1,40 @@
+#!/usr/bin/expect -f
+set timeout 120
+set pass "Hjj123456"
+set addr "/ip4/8.136.129.162/tcp/4001/p2p/12D3KooWLd56gZpYP2Q1hejJ2juN6GoYQcA9VMTcek6aetTRfwYi"
+set server_vip "10.98.237.157"
+
+# Prime sudo
+spawn sudo -v
+expect {
+    -re "Password:" {
+        send "$pass\r"
+    }
+}
+expect eof
+
+# Start node
+spawn sudo ./dist/bin/p2p-node-darwin-arm64 -port 4002 -config ./config_mac1 -bootstrap $addr
+expect {
+    "meshlink is running" {
+        send_user "\n--- NODE READY ---\n"
+    }
+}
+
+# Wait for DHT and networking
+sleep 20
+
+# Try ping
+spawn ping -c 10 $server_vip
+expect {
+    "10 packets transmitted, 10 packets received" {
+        send_user "\n--- PING SUCCESS ---\n"
+    }
+    timeout {
+        send_user "\n--- PING FAILED ---\n"
+    }
+}
+
+# Cleanup
+spawn sudo pkill -9 p2p-node
+expect eof
