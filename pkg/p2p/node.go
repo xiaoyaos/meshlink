@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,13 +135,13 @@ func NewNodeWithBootstrap(priv crypto.PrivKey, listenAddr string, enableRelay bo
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(net network.Network, conn network.Conn) {
 			remotePeer := conn.RemotePeer()
-			fmt.Printf(">>> [NETWORK] CONNECTED: peer=%s addr=%s\n", remotePeer, conn.RemoteMultiaddr())
+			fmt.Printf(">>> [网络] 已建立连接: 节点=%s 地址=%s\n", remotePeer, conn.RemoteMultiaddr())
 			if node.PeerConnectedHandler != nil {
 				node.PeerConnectedHandler(remotePeer)
 			}
 		},
 		DisconnectedF: func(net network.Network, conn network.Conn) {
-			fmt.Printf("<<< [NETWORK] DISCONNECTED: peer=%s\n", conn.RemotePeer())
+			fmt.Printf("<<< [网络] 已断开连接: 节点=%s\n", conn.RemotePeer())
 		},
 	})
 
@@ -153,9 +154,9 @@ func (n *Node) handleStream(s network.Stream) {
 	remotePeer := s.Conn().RemotePeer()
 
 	if !isDirectConn(s.Conn()) {
-		fmt.Printf("[tunnel] inbound: relayed stream peer=%s\n", remotePeer)
+		fmt.Printf("[隧道] 收到中继数据流: 节点=%s\n", remotePeer)
 	} else {
-		fmt.Printf("[tunnel] inbound: direct stream peer=%s\n", remotePeer)
+		fmt.Printf("[隧道] 收到直连数据流: 节点=%s\n", remotePeer)
 	}
 
 	header := make([]byte, 4)
@@ -163,21 +164,21 @@ func (n *Node) handleStream(s network.Stream) {
 		_, err := io.ReadFull(s, header)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("[tunnel] stream read error peer=%s: %v\n", remotePeer, err)
+				fmt.Printf("[隧道] 数据流读取错误 节点=%s: %v\n", remotePeer, err)
 			}
 			break
 		}
 
 		length := binary.BigEndian.Uint32(header)
 		if length > 2000 {
-			fmt.Printf("[tunnel] packet too large: %d\n", length)
+			fmt.Printf("[隧道] 数据包过大: %d\n", length)
 			break
 		}
 
 		buf := make([]byte, length)
 		_, err = io.ReadFull(s, buf)
 		if err != nil {
-			fmt.Printf("[tunnel] stream body read error peer=%s: %v\n", remotePeer, err)
+			fmt.Printf("[隧道] 数据体读取错误 节点=%s: %v\n", remotePeer, err)
 			break
 		}
 
@@ -187,7 +188,7 @@ func (n *Node) handleStream(s network.Stream) {
 	}
 
 	n.streams.Delete(remotePeer)
-	fmt.Printf("[tunnel] stream closed peer=%s\n", remotePeer)
+	fmt.Printf("[隧道] 数据流已关闭: 节点=%s\n", remotePeer)
 }
 
 // AddPeerAddrs 将发现到的地址加入 peerstore，返回直连地址和中继地址数量。
@@ -338,33 +339,58 @@ func (n *Node) SendPacket(target peer.ID, data []byte) error {
 func (n *Node) Bootstrap(addrs []string) error {
 	connected := false
 	for _, addrStr := range addrs {
-		addr, err := multiaddr.NewMultiaddr(addrStr)
+		// 尝试解析简写格式 (IP:Port:PeerID)
+		ma, err := ParseShorthandAddr(addrStr)
 		if err != nil {
-			fmt.Printf("[bootstrap] invalid addr: %v\n", err)
+			// 如果不是简写格式，尝试作为标准 Multiaddr 解析
+			ma, err = multiaddr.NewMultiaddr(addrStr)
+			if err != nil {
+				fmt.Printf("[bootstrap] skip invalid address %s: %v\n", addrStr, err)
+				continue
+			}
+		}
+
+		info, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			fmt.Printf("[bootstrap] invalid p2p address %s: %v\n", ma, err)
 			continue
 		}
-		info, err := peer.AddrInfoFromP2pAddr(addr)
-		if err != nil {
-			fmt.Printf("[bootstrap] invalid peer addr: %v\n", err)
-			continue
-		}
+
 		if err := n.Host.Connect(n.Ctx, *info); err != nil {
-			fmt.Printf("[bootstrap] connect failed peer=%s err=%v\n", info.ID, err)
-		} else {
-			fmt.Printf("[bootstrap] connected peer=%s\n", info.ID)
-			connected = true
+			fmt.Printf("[引导] 连接失败 peer=%s 错误=%v\n", info.ID, err)
+			continue
 		}
+		fmt.Printf("[引导] 已成功连接到节点 peer=%s\n", info.ID)
+		connected = true
 	}
 
 	if !connected && len(addrs) > 0 {
-		return fmt.Errorf("could not connect to any bootstrap nodes")
+		return fmt.Errorf("无法连接到任何引导节点")
 	}
 
-	if err := n.DHT.Bootstrap(n.Ctx); err != nil {
-		return err
+	if n.DHT != nil {
+		if err := n.DHT.Bootstrap(n.Ctx); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+// ParseShorthandAddr 尝试将 "IP:Port:PeerID" 格式解析为 Multiaddr
+func ParseShorthandAddr(s string) (multiaddr.Multiaddr, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("简写格式无效，应为 IP:端口:节点ID")
+	}
+
+	ip := parts[0]
+	port := parts[1]
+	peerID := parts[2]
+
+	// 构造标准 Multiaddr
+	maStr := fmt.Sprintf("/ip4/%s/tcp/%s/p2p/%s", ip, port, peerID)
+	return multiaddr.NewMultiaddr(maStr)
 }
 
 // Close 关闭节点

@@ -28,21 +28,75 @@ BINARY_NAME="p2p-node"
 PORT="4001"
 RELAY=false
 BOOTSTRAP_ADDR=""
+ADVERTISE_IP=""
 ARCH=""
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
+# 检查是否为交互模式（没有提供核心参数时）
+INTERACTIVE=false
+if [[ $# -eq 0 ]]; then
+  INTERACTIVE=true
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)       PORT="$2";           shift 2 ;;
-    --relay)      RELAY=true;          shift   ;;
-    --bootstrap)  BOOTSTRAP_ADDR="$2"; shift 2 ;;
-    --arch)       ARCH="$2";           shift 2 ;;
+    --port)          PORT="$2";           shift 2 ;;
+    --relay)         RELAY=true;          shift   ;;
+    --bootstrap)     BOOTSTRAP_ADDR="$2"; shift 2 ;;
+    --advertise-ip)  ADVERTISE_IP="$2";   shift 2 ;;
+    --arch)          ARCH="$2";           shift 2 ;;
     --help|-h)
       grep '^#' "$0" | grep -E '^\# ' | sed 's/^# //'
       exit 0 ;;
     *) error "未知参数: $1，使用 --help 查看帮助" ;;
   esac
 done
+
+# ── 交互式向导 ────────────────────────────────────────────────────────────────
+if [[ "$INTERACTIVE" == "true" ]]; then
+  echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+  echo -e "${BLUE}║      MeshLink 交互式安装向导             ║${NC}"
+  echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+  echo ""
+  
+  echo -e "请选择节点类型:"
+  echo -e "  1) ${YELLOW}引导/中继节点${NC} (通常用于具有公网 IP 的服务器)"
+  echo -e "  2) ${YELLOW}普通客户端${NC} (用于加入现有的网络)"
+  read -p "选择 [1-2]: " NODE_TYPE_CHOICE
+  
+  if [[ "$NODE_TYPE_CHOICE" == "1" ]]; then
+    RELAY=true
+    # 尝试自动获取公网 IP
+    DETECTED_IP=$(curl -s --connect-timeout 2 ifconfig.me || echo "")
+    echo ""
+    if [[ -n "$DETECTED_IP" ]]; then
+      read -p "检测到您的公网 IP 为 $DETECTED_IP，直接使用吗? [Y/n]: " USE_DETECTED
+      if [[ "$USE_DETECTED" =~ ^[Nn]$ ]]; then
+        read -p "请输入此服务器的公网 IP: " ADVERTISE_IP
+      else
+        ADVERTISE_IP="$DETECTED_IP"
+      fi
+    else
+      read -p "无法自动检测公网 IP，请输入此服务器的公网 IP: " ADVERTISE_IP
+    fi
+  else
+    RELAY=false
+    echo ""
+    echo -e "请输入引导节点地址 (支持格式 IP:Port:PeerID 或标准 Multiaddr):"
+    read -p "> " BOOTSTRAP_ADDR
+    while [[ -z "$BOOTSTRAP_ADDR" ]]; do
+      warn "地址不能为空，请重新输入:"
+      read -p "> " BOOTSTRAP_ADDR
+    done
+  fi
+  
+  echo ""
+  read -p "使用默认监听端口 4001 吗? [Y/n]: " PORT_DEFAULT
+  if [[ "$PORT_DEFAULT" =~ ^[Nn]$ ]]; then
+    read -p "请输入自定义端口: " PORT
+  fi
+  echo ""
+fi
 
 # ── 权限检查 ──────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "请使用 root 权限运行: sudo bash install.sh"
@@ -89,7 +143,7 @@ success "二进制和管理命令安装完成"
 # 2. 创建配置目录
 info "创建配置目录 ${CONFIG_DIR} ..."
 mkdir -p "${CONFIG_DIR}"
-chmod 700 "${CONFIG_DIR}"
+chmod 755 "${CONFIG_DIR}"
 success "配置目录就绪"
 
 # 3. 写入环境配置文件（供 systemd 读取）
@@ -109,27 +163,35 @@ CONFIG_DIR=${CONFIG_DIR}/data
 RELAY=${RELAY}
 
 # 引导节点 Multiaddr（留空则为引导节点模式）
-# 示例: /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
 BOOTSTRAP_ADDR=${BOOTSTRAP_ADDR}
+
+# 公网 IP（用于生成简写地址）
+ADVERTISE_IP=${ADVERTISE_IP}
 EOF
 chmod 600 "${ENV_FILE}"
 success "配置文件写入完成"
 
 # 4. 创建数据目录
 mkdir -p "${CONFIG_DIR}/data"
-chmod 700 "${CONFIG_DIR}/data"
+chmod 755 "${CONFIG_DIR}/data"
 
 # 5. 构建 ExecStart 命令
 EXEC_START="${INSTALL_DIR}/${BINARY_NAME} -port \${PORT} -config \${CONFIG_DIR}"
-EXEC_START_EXPANDED="${INSTALL_DIR}/${BINARY_NAME} -port ${PORT} -config ${CONFIG_DIR}/data"
 if [[ "$RELAY" == "true" ]]; then
   EXEC_START="${EXEC_START} -relay"
-  EXEC_START_EXPANDED="${EXEC_START_EXPANDED} -relay"
 fi
 if [[ -n "$BOOTSTRAP_ADDR" ]]; then
   EXEC_START="${EXEC_START} -bootstrap \${BOOTSTRAP_ADDR}"
-  EXEC_START_EXPANDED="${EXEC_START_EXPANDED} -bootstrap ${BOOTSTRAP_ADDR}"
 fi
+if [[ -n "\${ADVERTISE_IP}" ]]; then
+  EXEC_START="${EXEC_START} -advertise-ip \${ADVERTISE_IP}"
+fi
+
+# 预展开用于日志显示的命令
+EXEC_START_EXPANDED="${INSTALL_DIR}/${BINARY_NAME} -port ${PORT} -config ${CONFIG_DIR}/data"
+[[ "$RELAY" == "true" ]] && EXEC_START_EXPANDED="${EXEC_START_EXPANDED} -relay"
+[[ -n "$BOOTSTRAP_ADDR" ]] && EXEC_START_EXPANDED="${EXEC_START_EXPANDED} -bootstrap ${BOOTSTRAP_ADDR}"
+[[ -n "$ADVERTISE_IP" ]] && EXEC_START_EXPANDED="${EXEC_START_EXPANDED} -advertise-ip ${ADVERTISE_IP}"
 
 # 6. 写入 systemd service
 info "写入 systemd 服务 ${SERVICE_FILE} ..."

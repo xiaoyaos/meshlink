@@ -23,6 +23,7 @@ func main() {
 	configDir := flag.String("config", "./config", "config directory")
 	bootstrapAddr := flag.String("bootstrap", "", "bootstrap node multiaddr")
 	enableRelay := flag.Bool("relay", false, "enable libp2p relay service")
+	advertiseIP := flag.String("advertise-ip", "", "public IP to advertise in shorthand address")
 	logFile := flag.String("logfile", "", "write logs to file")
 	parentPID := flag.Int("parent-pid", 0, "parent process ID to monitor")
 	flag.Parse()
@@ -43,7 +44,7 @@ func main() {
 				}
 				time.Sleep(2 * time.Second)
 			}
-			fmt.Println("[shutdown] parent process died, exiting")
+			fmt.Println("[退出] 父进程已关闭，正在退出程序")
 			os.Exit(0)
 		}()
 	}
@@ -69,27 +70,24 @@ func main() {
 		if err != nil {
 			log.Fatalf("无法打开日志文件: %v", err)
 		}
-		// 重定向全局 log 和 fmt 使用的输出
+		// 重定向全局 log 和 fmt 使用标的输出
 		os.Stdout = f
 		os.Stderr = f
 		log.SetOutput(f)
-
-		// 也要确保后续的 fmt.Printf 能够看到变化
-		// 注意：fmt 内部直接引用 os.Stdout 变量
 	}
 
 	// 1. 加载身份
 	priv, err := identity.LoadOrGenerateKey(*configDir)
 	if err != nil {
-		log.Fatalf("failed to load identity: %v", err)
+		log.Fatalf("[错误] 无法加载节点身份: %v", err)
 	}
 
 	id, virtualIP, err := identity.GetPeerInfo(priv)
 	if err != nil {
-		log.Fatalf("failed to get peer info: %v", err)
+		log.Fatalf("[错误] 无法获取节点信息: %v", err)
 	}
 
-	fmt.Printf("[node] peer=%s vip=%s\n", id, virtualIP)
+	fmt.Printf("[节点] ID=%s 虚拟IP=%s\n", id, virtualIP)
 
 	var bootstrapAddrs []string
 	if *bootstrapAddr != "" {
@@ -103,46 +101,75 @@ func main() {
 	}
 	defer node.Close()
 
+	// 获取外部可达地址
 	var addrList []string
-	for _, addr := range node.Host.Addrs() {
-		fullAddr := fmt.Sprintf("%s/p2p/%s", addr, node.Host.ID())
-		addrList = append(addrList, fullAddr)
+	var shorthandList []string
+
+	// 如果显式指定了公网 IP，优先将其加入简写列表
+	if *advertiseIP != "" {
+		shorthandList = append(shorthandList, fmt.Sprintf("%s:%s:%s", *advertiseIP, *port, node.Host.ID()))
 	}
-	fmt.Printf("[listen] addrs=%d port=%s relay=%v\n", len(addrList), *port, *enableRelay)
+
+	for _, addr := range node.Host.Addrs() {
+		// 过滤本地回环和不安全地址
+		addrStr := addr.String()
+		if strings.Contains(addrStr, "127.0.0.1") || strings.Contains(addrStr, "::1") {
+			continue
+		}
+		fullAddr := fmt.Sprintf("%s/p2p/%s", addrStr, node.Host.ID())
+		addrList = append(addrList, fullAddr)
+
+		// 构造简写格式 (仅限 IPv4 TCP)
+		if strings.HasPrefix(addrStr, "/ip4/") && strings.Contains(addrStr, "/tcp/") {
+			parts := strings.Split(addrStr, "/")
+			if len(parts) >= 5 {
+				ip := parts[2]
+				port := parts[4]
+				// 避免重复（如果 advertiseIP 已经加过了）
+				if ip != *advertiseIP {
+					shorthandList = append(shorthandList, fmt.Sprintf("%s:%s:%s", ip, port, node.Host.ID()))
+				}
+			}
+		}
+	}
+	fmt.Printf("[网络] 监听地址=%d 端口=%s 中继模式=%v\n", len(addrList), *port, *enableRelay)
 
 	// 将地址和虚拟IP写入文件方便查看（无需翻日志）
 	addrFile := filepath.Join(*configDir, "address.txt")
-	fileContent := fmt.Sprintf("Virtual IP: %s\n\nMultiaddr:\n%s\n", virtualIP, strings.Join(addrList, "\n"))
+	fileContent := fmt.Sprintf("虚拟IP: %s\n\n简写格式 (推荐):\n%s\n\n标准 Multiaddr:\n%s\n",
+		virtualIP, strings.Join(shorthandList, "\n"), strings.Join(addrList, "\n"))
 	if err := os.WriteFile(addrFile, []byte(fileContent), 0644); err == nil {
-		fmt.Printf("[config] address_file=%s\n", addrFile)
+		// 确保即便父目录是 700，文件本身也是可读的（如果上级目录允许的话）
+		os.Chmod(addrFile, 0644)
+		fmt.Printf("[配置] 地址信息已保存到: %s\n", addrFile)
 	}
 
 	// 4. 创建 TUN 网卡
 	itf, err := tun.New(virtualIP)
 	if err != nil {
-		log.Fatalf("[致命错误] 无法创建虚拟网卡，权限不足。请在 Linux/macOS 使用 sudo 运行，或在 Windows 使用管理员权限: %v", err)
+		log.Fatalf("[致命错误] 无法创建虚拟网卡，权限不足: %v", err)
 	}
 	defer itf.Close()
-	fmt.Printf("[tun] name=%s ip=%s\n", itf.Name, virtualIP)
+	fmt.Printf("[网卡] 名称=%s IP=%s\n", itf.Name, virtualIP)
 
 	// 5. 启动网桥 (必须在 Bootstrap 之前，以确保捕捉到初始连接事件)
-	br := bridge.New(itf, node)
+	br := bridge.New(itf, node, *configDir)
 	br.Start()
 
 	// 6. 连接引导节点
 	if *bootstrapAddr != "" {
 		if err := node.Bootstrap([]string{*bootstrapAddr}); err != nil {
-			fmt.Printf("[fatal] bootstrap failed: %v\n", err)
+			fmt.Printf("[引导] 连接失败: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	fmt.Println("[ready] meshlink is running")
+	fmt.Println("[就绪] MeshLink 已启动并在后台运行")
 
 	// 等待信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	fmt.Println("[shutdown] stopping")
+	fmt.Println("[退出] 正在停止服务")
 }

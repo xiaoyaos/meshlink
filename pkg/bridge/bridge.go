@@ -2,7 +2,10 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,11 +27,28 @@ const (
 	fastAdvertiseCount = 12
 )
 
+// PeerInfo 存储单个对等节点的状态
+type PeerInfo struct {
+	VIP      string `json:"vip"`
+	ID       string `json:"id"`
+	Direct   bool   `json:"direct"`
+	LastSeen string `json:"last_seen"`
+}
+
+// GlobalState 存储整个节点的运行状态
+type GlobalState struct {
+	SelfVIP   string              `json:"self_vip"`
+	SelfID    string              `json:"self_id"`
+	Peers     map[string]PeerInfo `json:"peers"` // VIP -> PeerInfo
+	UpdatedAt string              `json:"updated_at"`
+}
+
 // Bridge 连接 TUN 网卡和 P2P 网络
 type Bridge struct {
 	tun       *tun.Interface
 	node      *p2p.Node
 	ctx       context.Context
+	configDir string // 存储状态文件的路径
 	announce  bool
 	lastAdvOK bool
 	logMu     sync.Mutex
@@ -45,12 +65,13 @@ type routeResolveCall struct {
 	err  error
 }
 
-func New(t *tun.Interface, n *p2p.Node) *Bridge {
+func New(t *tun.Interface, n *p2p.Node, configDir string) *Bridge {
 	b := &Bridge{
-		tun:     t,
-		node:    n,
-		ctx:     n.Ctx,
-		lastLog: make(map[string]time.Time),
+		tun:       t,
+		node:      n,
+		ctx:       n.Ctx,
+		configDir: configDir,
+		lastLog:   make(map[string]time.Time),
 	}
 
 	// 注册控制协议，用于直接交换 VIP
@@ -59,7 +80,7 @@ func New(t *tun.Interface, n *p2p.Node) *Bridge {
 	// 当建立连接时，主动发起 VIP 告知
 	n.PeerConnectedHandler = func(p peer.ID) {
 		if b.shouldLog("control:send:"+p.String(), time.Minute) {
-			fmt.Printf("[control] sending VIP info to peer=%s\n", p)
+			fmt.Printf("[控制] 正在向节点同步 VIP 信息: %s\n", p)
 		}
 		// 1. 发送自己的 VIP
 		_ = b.sendLocalVIP(p)
@@ -72,6 +93,7 @@ func New(t *tun.Interface, n *p2p.Node) *Bridge {
 
 	return b
 }
+
 
 func (b *Bridge) sendLocalVIP(target peer.ID) error {
 	ctx, cancel := context.WithTimeout(b.ctx, 15*time.Second)
@@ -181,11 +203,11 @@ func (b *Bridge) Start() {
 				n, err := b.tun.Write(data)
 				if err != nil {
 					if b.shouldLog("tun:write-err", time.Second*5) {
-						fmt.Printf("[tun] write failed: %v\n", err)
+						fmt.Printf("[网卡] 写入失败: %v\n", err)
 					}
 				} else {
-					if b.shouldLog("bridge:inbound", time.Second*5) {
-						fmt.Printf("[bridge] inbound packet: size=%d\n", n)
+					if b.shouldLog("bridge:inbound", time.Second*10) {
+						fmt.Printf("[网桥] 收到入站数据包: 长度=%d\n", n)
 					}
 				}
 				return
@@ -196,7 +218,7 @@ func (b *Bridge) Start() {
 				if peerID, ok := b.routeCache.Load(dstIP); ok {
 					targetID := peerID.(peer.ID)
 					if b.shouldLog("bridge:forward:"+dstIP, time.Second*5) {
-						fmt.Printf("[bridge] forwarding packet: dst=%s via peer=%s\n", dstIP, targetID)
+						fmt.Printf("[中转] 正在转发数据包: 目标=%s 通过节点=%s\n", dstIP, targetID)
 					}
 					go func() {
 						_ = b.node.SendPacket(targetID, data)
@@ -215,6 +237,66 @@ func (b *Bridge) Start() {
 
 	// 4. 定期向所有已连接的 Peer 宣告自己的 VIP (保底机制)
 	go b.periodicAnnounceLoop()
+
+	// 5. 定期更新实时状态文件供 CLI 工具查看
+	go b.stateUpdateLoop()
+}
+
+func (b *Bridge) stateUpdateLoop() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.writeStateFile()
+		case <-b.ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *Bridge) writeStateFile() {
+	state := GlobalState{
+		SelfVIP:   b.tun.IP.String(),
+		SelfID:    b.node.Host.ID().String(),
+		Peers:     make(map[string]PeerInfo),
+		UpdatedAt: time.Now().Format("2006-01-02 15:04:05"),
+	}
+
+	b.routeCache.Range(func(key, value any) bool {
+		vip := key.(string)
+		ownerID := value.(peer.ID)
+
+		if vip == state.SelfVIP {
+			return true
+		}
+
+		// 检查连接类型
+		isDirect := false
+		for _, conn := range b.node.Host.Network().ConnsToPeer(ownerID) {
+			if !conn.Stat().Limited && !strings.Contains(conn.RemoteMultiaddr().String(), "p2p-circuit") {
+				isDirect = true
+				break
+			}
+		}
+
+		state.Peers[vip] = PeerInfo{
+			VIP:      vip,
+			ID:       ownerID.String(),
+			Direct:   isDirect,
+			LastSeen: time.Now().Format("15:04:05"),
+		}
+		return true
+	})
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
+
+	statePath := filepath.Join(b.configDir, "state.json")
+	_ = os.WriteFile(statePath, data, 0644)
 }
 
 func (b *Bridge) periodicAnnounceLoop() {
@@ -293,22 +375,22 @@ func (b *Bridge) handleOutgoingPacket(data []byte) {
 		// 异步处理路由解析和发送，避免阻塞 worker pool
 		go func() {
 			if b.shouldLog("bridge:out-start:"+dstIP, time.Second) {
-				fmt.Printf("[bridge] resolving route for %s\n", dstIP)
+				fmt.Printf("[路由] 正在寻址: %s\n", dstIP)
 			}
 			peerID, err := b.resolvePeerID(dstIP)
 			if err != nil {
 				if b.shouldLog("route:"+dstIP, 15*time.Second) {
-					fmt.Printf("[route] resolve failed ip=%s err=%v\n", dstIP, err)
+					fmt.Printf("[路由] 寻址失败 目标=%s 错误=%v\n", dstIP, err)
 				}
 				return
 			}
 
 			if err := b.node.SendPacket(peerID, data); err != nil {
 				if b.shouldLog("send:"+dstIP, 10*time.Second) {
-					fmt.Printf("[tunnel] send failed ip=%s peer=%s err=%v\n", dstIP, peerID, err)
+					fmt.Printf("[隧道] 发送失败 目标=%s 节点=%s 错误=%v\n", dstIP, peerID, err)
 				}
 			} else if b.shouldLog("bridge:outbound:"+dstIP, time.Second*5) {
-				fmt.Printf("[bridge] outbound packet: dst=%s size=%d\n", dstIP, len(data))
+				fmt.Printf("[网桥] 已发包: 目标=%s 长度=%d\n", dstIP, len(data))
 			}
 		}()
 	}
