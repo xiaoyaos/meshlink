@@ -86,20 +86,14 @@ if [[ -f "${INSTALL_DIR}/meshlink" ]]; then
   success "管理脚本已删除"
 fi
 
-# 4. 处理配置目录
-if [[ "$PURGE" == "true" ]]; then
-  if [[ -d "${CONFIG_DIR}" ]]; then
-    info "删除配置目录 ${CONFIG_DIR} ..."
-    rm -rf "${CONFIG_DIR}"
-    success "配置目录已删除"
-  fi
-else
-  warn "配置目录 ${CONFIG_DIR} 已保留（包含节点身份密钥）"
-  warn "如需彻底删除，请运行: sudo bash uninstall.sh --purge"
-fi
+# 4. 彻底清理配置目录和日志
+info "正在清除所有配置目录 ${CONFIG_DIR} ..."
+rm -rf "${CONFIG_DIR}"
+rm -f "/var/log/meshlink.log" 2>/dev/null || true
+success "所有配置、密钥及日志痕迹已清除"
 
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  MeshLink 节点已成功卸载！${NC}"
+echo -e "${GREEN}  MeshLink 节点已彻底卸载！${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""

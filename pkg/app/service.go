@@ -179,6 +179,9 @@ func (s *VPNService) Start(bootstrapAddr string) error {
 	s.daemonName = filepath.Base(binPath)
 
 	args := []string{"-port", s.port, "-config", s.configDir, "-parent-pid", fmt.Sprintf("%d", os.Getpid())}
+	if s.enableRelay {
+		args = append(args, "-relay")
+	}
 	if bootstrapAddr != "" {
 		args = append(args, "-bootstrap", bootstrapAddr)
 	}
@@ -352,6 +355,7 @@ func (s *VPNService) handleDaemonLogLine(line string) {
 
 func isDaemonReady(line string) bool {
 	return strings.Contains(line, "[ready]") ||
+		strings.Contains(line, "[就绪]") ||
 		strings.Contains(line, "[STATE] CONNECTED") ||
 		strings.Contains(line, "Network is ready")
 }

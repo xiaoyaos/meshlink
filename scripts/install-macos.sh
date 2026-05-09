@@ -136,4 +136,5 @@ launchctl unload "${PLIST_PATH}" 2>/dev/null || true
 launchctl load -w "${PLIST_PATH}"
 
 success "MeshLink 已在 macOS 上成功安装并运行！"
-echo -e "使用 ${YELLOW}meshlink status${NC} 查看状态"
+echo -e "使用 ${YELLOW}meshlink stats${NC} 查看实时状态"
+echo -e "使用 ${YELLOW}meshlink --help${NC} 查看帮助手册"

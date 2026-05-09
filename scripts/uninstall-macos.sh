@@ -14,12 +14,8 @@ echo "[INFO] 正在清理二进制文件 ..."
 rm -f "/usr/local/bin/${BINARY_NAME}"
 rm -f "/usr/local/bin/meshlink"
 
-if [[ "$1" == "--purge" ]]; then
-    echo "[WARN] 正在彻底清除配置和身份密钥 ..."
-    rm -rf "/etc/meshlink"
-    rm -f "/var/log/meshlink.log"
-else
-    echo "[INFO] 已保留配置文件和密钥。若要彻底删除，请运行: sudo bash uninstall-macos.sh --purge"
-fi
+echo "[INFO] 正在彻底清除所有配置、身份密钥和日志痕迹 ..."
+rm -rf "/etc/meshlink"
+rm -f "/var/log/meshlink.log"
 
-echo "[OK] MeshLink 已成功从 macOS 卸载。"
+echo "[OK] MeshLink 已彻底从 macOS 卸载，未残留任何痕迹。"

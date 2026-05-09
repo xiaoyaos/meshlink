@@ -38,13 +38,17 @@ type Node struct {
 	direct sync.Map
 	punch  sync.Map
 
-	streams sync.Map // map[peer.ID]network.Stream
+	streams       sync.Map // map[peer.ID]network.Stream
+	streamWriteMu sync.Map // map[peer.ID]*sync.Mutex
 
 	// PacketHandler 当接收到 P2P 流量时的处理回调（通常写入 TUN）
 	PacketHandler func(data []byte)
 
 	// PeerConnectedHandler 当建立新连接时的回调（用于交换 VIP）
 	PeerConnectedHandler func(p peer.ID)
+
+	// PeerDisconnectedHandler 当连接断开时的回调（用于清理路由）
+	PeerDisconnectedHandler func(p peer.ID)
 }
 
 // NewNode 创建并启动一个 libp2p 节点
@@ -90,6 +94,13 @@ func NewNodeWithBootstrap(priv crypto.PrivKey, listenAddr string, enableRelay bo
 		}),
 	}
 
+	if enableRelay {
+		opts = append(opts,
+			libp2p.ForceReachabilityPublic(),
+			libp2p.EnableNATService(),
+		)
+	}
+
 	staticRelays := parseRelayCandidates(bootstrapAddrs)
 	if len(staticRelays) > 0 && !enableRelay {
 		opts = append(opts,
@@ -110,7 +121,7 @@ func NewNodeWithBootstrap(priv crypto.PrivKey, listenAddr string, enableRelay bo
 
 	var r *relay.Relay
 	if enableRelay {
-		r, err = relay.New(h)
+		r, err = relay.New(h, relay.WithInfiniteLimits())
 		if err != nil {
 			fmt.Printf("[relay] failed to enable service: %v\n", err)
 		} else {
@@ -141,7 +152,14 @@ func NewNodeWithBootstrap(priv crypto.PrivKey, listenAddr string, enableRelay bo
 			}
 		},
 		DisconnectedF: func(net network.Network, conn network.Conn) {
-			fmt.Printf("<<< [网络] 已断开连接: 节点=%s\n", conn.RemotePeer())
+			remotePeer := conn.RemotePeer()
+			// 只有当对该节点的所有连接都断开时，才认为该节点离线
+			if len(h.Network().ConnsToPeer(remotePeer)) == 0 {
+				fmt.Printf("<<< [网络] 已彻底断开连接: 节点=%s\n", remotePeer)
+				if node.PeerDisconnectedHandler != nil {
+					node.PeerDisconnectedHandler(remotePeer)
+				}
+			}
 		},
 	})
 
@@ -161,34 +179,37 @@ func (n *Node) handleStream(s network.Stream) {
 
 	header := make([]byte, 4)
 	for {
+		// 1. 严格读取 4 字节长度头部
 		_, err := io.ReadFull(s, header)
 		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("[隧道] 数据流读取错误 节点=%s: %v\n", remotePeer, err)
+			if err != io.EOF && !strings.Contains(err.Error(), "stream reset") {
+				fmt.Printf("[隧道] 帧同步丢失 节点=%s: %v\n", remotePeer, err)
 			}
 			break
 		}
 
 		length := binary.BigEndian.Uint32(header)
 		if length > 2000 {
-			fmt.Printf("[隧道] 数据包过大: %d\n", length)
+			fmt.Printf("[隧道] 收到异常巨大的包 (%d 字节)，强制重置流: 节点=%s\n", length, remotePeer)
+			_ = s.Reset()
 			break
 		}
 
+		// 2. 根据长度严格读取完整数据包
 		buf := make([]byte, length)
 		_, err = io.ReadFull(s, buf)
 		if err != nil {
-			fmt.Printf("[隧道] 数据体读取错误 节点=%s: %v\n", remotePeer, err)
+			fmt.Printf("[隧道] 数据体读取不完整 节点=%s: %v\n", remotePeer, err)
 			break
 		}
 
+		// 3. 交给网桥处理
 		if n.PacketHandler != nil {
 			n.PacketHandler(buf)
 		}
 	}
 
-	n.streams.Delete(remotePeer)
-	fmt.Printf("[隧道] 数据流已关闭: 节点=%s\n", remotePeer)
+	fmt.Printf("[隧道] 数据流已断开: 节点=%s\n", remotePeer)
 }
 
 // AddPeerAddrs 将发现到的地址加入 peerstore，返回直连地址和中继地址数量。
@@ -209,7 +230,8 @@ func (n *Node) AddrCounts() (int, int) {
 
 // EnsureDirectConn 尝试与目标节点建立连接，优先尝试直连。
 func (n *Node) EnsureDirectConn(target peer.ID) error {
-	if c := n.bestConn(target); c != nil {
+	existing := n.bestConn(target)
+	if existing != nil && isDirectConn(existing) {
 		return nil
 	}
 
@@ -219,12 +241,18 @@ func (n *Node) EnsureDirectConn(target peer.ID) error {
 		found, err := n.DHT.FindPeer(ctx, target)
 		cancel()
 		if err != nil {
+			if existing != nil {
+				return nil
+			}
 			return fmt.Errorf("find peer addresses: %w", err)
 		}
 		info = found
 	}
 
 	if len(info.Addrs) == 0 {
+		if existing != nil {
+			return nil
+		}
 		return fmt.Errorf("no addresses for peer %s", target)
 	}
 
@@ -289,6 +317,7 @@ func (n *Node) getStream(target peer.ID) (network.Stream, error) {
 	}
 
 	ctx, cancel := context.WithTimeout(n.Ctx, 15*time.Second)
+	ctx = network.WithAllowLimitedConn(ctx, "p2p-vpn relay fallback stream")
 	defer cancel()
 	s, err := n.Host.NewStream(ctx, target, ProtocolID)
 	if err != nil {
@@ -311,43 +340,46 @@ func (n *Node) getStream(target peer.ID) (network.Stream, error) {
 
 // SendPacket 向指定节点发送 IP 数据包。
 func (n *Node) SendPacket(target peer.ID, data []byte) error {
-	s, err := n.getStream(target)
-	if err != nil {
-		return err
-	}
+	// 必须构建单一缓冲区进行原子写入，防止多协程写入 yamux 时 header 和 payload 分离导致对端同步丢失
+	totalLen := 4 + len(data)
+	frame := make([]byte, totalLen)
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(data)))
+	copy(frame[4:], data)
 
-	// 使用长度前缀进行帧包装
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(data)))
+	mu := n.streamLock(target)
+	mu.Lock()
+	defer mu.Unlock()
 
-	if _, err := s.Write(header); err != nil {
-		n.streams.Delete(target)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		s, err := n.getStream(target)
+		if err != nil {
+			return err
+		}
+
+		nn, err := s.Write(frame)
+		if err == nil && nn == len(frame) {
+			return nil
+		}
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		lastErr = err
+		n.streams.CompareAndDelete(target, s)
 		_ = s.Reset()
-		return fmt.Errorf("send length prefix: %w", err)
 	}
 
-	if _, err := s.Write(data); err != nil {
-		n.streams.Delete(target)
-		_ = s.Reset()
-		return fmt.Errorf("send packet data: %w", err)
-	}
-
-	return nil
+	return fmt.Errorf("数据帧写入失败: %w", lastErr)
 }
 
 // Bootstrap 连接到一组引导节点
 func (n *Node) Bootstrap(addrs []string) error {
 	connected := false
 	for _, addrStr := range addrs {
-		// 尝试解析简写格式 (IP:Port:PeerID)
-		ma, err := ParseShorthandAddr(addrStr)
+		ma, err := parsePeerAddr(addrStr)
 		if err != nil {
-			// 如果不是简写格式，尝试作为标准 Multiaddr 解析
-			ma, err = multiaddr.NewMultiaddr(addrStr)
-			if err != nil {
-				fmt.Printf("[bootstrap] skip invalid address %s: %v\n", addrStr, err)
-				continue
-			}
+			fmt.Printf("[bootstrap] skip invalid address %s: %v\n", addrStr, err)
+			continue
 		}
 
 		info, err := peer.AddrInfoFromP2pAddr(ma)
@@ -379,6 +411,7 @@ func (n *Node) Bootstrap(addrs []string) error {
 
 // ParseShorthandAddr 尝试将 "IP:Port:PeerID" 格式解析为 Multiaddr
 func ParseShorthandAddr(s string) (multiaddr.Multiaddr, error) {
+	s = strings.TrimSpace(s)
 	parts := strings.Split(s, ":")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("简写格式无效，应为 IP:端口:节点ID")
@@ -387,6 +420,9 @@ func ParseShorthandAddr(s string) (multiaddr.Multiaddr, error) {
 	ip := parts[0]
 	port := parts[1]
 	peerID := parts[2]
+	if ip == "" || port == "" || peerID == "" {
+		return nil, fmt.Errorf("简写格式无效，应为 IP:端口:节点ID")
+	}
 
 	// 构造标准 Multiaddr
 	maStr := fmt.Sprintf("/ip4/%s/tcp/%s/p2p/%s", ip, port, peerID)
@@ -403,9 +439,9 @@ func parseRelayCandidates(addrs []string) []peer.AddrInfo {
 	relays := make([]peer.AddrInfo, 0, len(addrs))
 	seen := make(map[peer.ID]struct{})
 	for _, addrStr := range addrs {
-		addr, err := multiaddr.NewMultiaddr(addrStr)
+		addr, err := parsePeerAddr(addrStr)
 		if err != nil {
-			fmt.Printf("[relay] ignore invalid bootstrap addr: %v\n", err)
+			fmt.Printf("[relay] ignore invalid bootstrap addr %s: %v\n", addrStr, err)
 			continue
 		}
 		info, err := peer.AddrInfoFromP2pAddr(addr)
@@ -420,6 +456,22 @@ func parseRelayCandidates(addrs []string) []peer.AddrInfo {
 		relays = append(relays, *info)
 	}
 	return relays
+}
+
+func parsePeerAddr(addrStr string) (multiaddr.Multiaddr, error) {
+	addrStr = strings.TrimSpace(addrStr)
+	if addrStr == "" {
+		return nil, fmt.Errorf("empty peer address")
+	}
+	if addr, err := ParseShorthandAddr(addrStr); err == nil {
+		return addr, nil
+	}
+	return multiaddr.NewMultiaddr(addrStr)
+}
+
+func (n *Node) streamLock(target peer.ID) *sync.Mutex {
+	actual, _ := n.streamWriteMu.LoadOrStore(target, &sync.Mutex{})
+	return actual.(*sync.Mutex)
 }
 
 func (n *Node) bestConn(target peer.ID) network.Conn {

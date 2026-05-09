@@ -18,6 +18,10 @@ import (
 	"p2p/pkg/utils"
 )
 
+var (
+	Version = "dev" // 由 Makefile 在编译时注入
+)
+
 func main() {
 	port := flag.String("port", "4001", "libp2p listen port")
 	configDir := flag.String("config", "./config", "config directory")
@@ -136,8 +140,8 @@ func main() {
 
 	// 将地址和虚拟IP写入文件方便查看（无需翻日志）
 	addrFile := filepath.Join(*configDir, "address.txt")
-	fileContent := fmt.Sprintf("虚拟IP: %s\n\n简写格式 (推荐):\n%s\n\n标准 Multiaddr:\n%s\n",
-		virtualIP, strings.Join(shorthandList, "\n"), strings.Join(addrList, "\n"))
+	fileContent := fmt.Sprintf("版本: %s\n虚拟IP: %s\n\n简写格式 (推荐):\n%s\n\n标准 Multiaddr:\n%s\n",
+		Version, virtualIP, strings.Join(shorthandList, "\n"), strings.Join(addrList, "\n"))
 	if err := os.WriteFile(addrFile, []byte(fileContent), 0644); err == nil {
 		// 确保即便父目录是 700，文件本身也是可读的（如果上级目录允许的话）
 		os.Chmod(addrFile, 0644)
@@ -153,8 +157,9 @@ func main() {
 	fmt.Printf("[网卡] 名称=%s IP=%s\n", itf.Name, virtualIP)
 
 	// 5. 启动网桥 (必须在 Bootstrap 之前，以确保捕捉到初始连接事件)
-	br := bridge.New(itf, node, *configDir)
+	br := bridge.New(itf, node, *configDir, Version)
 	br.Start()
+
 
 	// 6. 连接引导节点
 	if *bootstrapAddr != "" {
