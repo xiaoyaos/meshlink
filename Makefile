@@ -6,13 +6,17 @@ BIN_DIR := $(DIST_DIR)/bin
 PKG_DIR := $(DIST_DIR)/packages
 VERSION ?= 1.0.0
 GO_LDFLAGS := -s -w
+HOST_UID := $(shell id -u)
+HOST_GID := $(shell id -g)
+HOST_GOMODCACHE := $(shell go env GOMODCACHE)
+DOCKER_GOCACHE ?= /tmp/meshlink-go-build-cache
 
-.PHONY: all clean dist release-cli package-linux package-macos package-windows verify
+.PHONY: all clean dist release-cli package-linux package-macos package-windows desktop desktop-macos desktop-windows verify
 
 all: dist
 
-# Full production build of CLI packages for all platforms.
-dist: clean release-cli package-linux package-macos package-windows
+# Full production build of CLI and desktop packages for all platforms.
+dist: clean release-cli package-linux package-macos package-windows desktop
 
 # Build CLI nodes for all supported platforms and architectures.
 release-cli:
@@ -34,9 +38,36 @@ package-macos: release-cli
 package-windows: release-cli
 	@bash scripts/package-windows.sh $(VERSION)
 
+desktop: desktop-macos desktop-windows
+
+desktop-macos: release-cli
+	@bash scripts/package-desktop-macos.sh $(VERSION)
+
+desktop-windows: release-cli
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+		bash scripts/package-desktop-windows.sh $(VERSION); \
+	elif command -v docker >/dev/null 2>&1; then \
+		docker image inspect meshlink-win-builder >/dev/null 2>&1 || docker build -f Dockerfile.windows-build -t meshlink-win-builder .; \
+		mkdir -p "$(DOCKER_GOCACHE)"; \
+		docker run --rm \
+			-u "$(HOST_UID):$(HOST_GID)" \
+			-e HOME=/tmp \
+			-e GOCACHE=/tmp/go-build-cache \
+			-e GOMODCACHE=/go/pkg/mod \
+			-v "$(CURDIR):/build" \
+			-v "$(HOST_GOMODCACHE):/go/pkg/mod" \
+			-v "$(DOCKER_GOCACHE):/tmp/go-build-cache" \
+			-w /build \
+			meshlink-win-builder \
+			bash -lc 'export PATH=/usr/local/go/bin:$$PATH; bash scripts/package-desktop-windows.sh $(VERSION)'; \
+	else \
+		echo "Missing MinGW-w64 toolchain or Docker; cannot build Windows desktop package." >&2; \
+		exit 1; \
+	fi
+
 verify:
 	go test ./cmd/... ./pkg/...
-	go build ./cmd/p2p ./cmd/diag ./pkg/...
+	go build -buildvcs=false ./cmd/p2p ./cmd/diag ./cmd/desktop ./pkg/...
 	go vet ./cmd/... ./pkg/...
 
 clean:

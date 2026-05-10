@@ -98,6 +98,10 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   echo ""
 fi
 
+if [[ "$RELAY" != "true" && -z "$BOOTSTRAP_ADDR" ]]; then
+  error "客户端模式必须指定引导节点: --bootstrap ADDR；如果本机是公网引导节点，请使用 --relay"
+fi
+
 # ── 权限检查 ──────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && error "请使用 root 权限运行: sudo bash install.sh"
 
@@ -168,7 +172,7 @@ BOOTSTRAP_ADDR=${BOOTSTRAP_ADDR}
 # 公网 IP（用于生成简写地址）
 ADVERTISE_IP=${ADVERTISE_IP}
 EOF
-chmod 600 "${ENV_FILE}"
+chmod 644 "${ENV_FILE}"
 success "配置文件写入完成"
 
 # 4. 创建数据目录

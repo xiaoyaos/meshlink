@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -188,20 +189,31 @@ func (s *VPNService) Start(bootstrapAddr string) error {
 
 	var cmd *exec.Cmd
 	logPath := filepath.Join(s.configDir, "daemon.log")
+	startupLogPath := filepath.Join(s.configDir, "daemon-startup.log")
 
 	if runtime.GOOS == "windows" {
 		// Windows: 需要提权启动 CLI 以创建 TUN 网卡
 		// 因为 GUI 目前是非管理员运行，我们通过 PowerShell 的 RunAs 动词来启动 CLI。
 		// 为了捕获输出，我们将 CLI 的输出重定向到临时文件，由 GUI 轮询读取。
-		os.Remove(logPath) // 清理旧日志
+		if err := resetLogFile(logPath); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("failed to prepare daemon log: %v", err)
+		}
+		if err := resetLogFile(startupLogPath); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("failed to prepare startup log: %v", err)
+		}
 
 		// 使用 CLI 新增的 -logfile 参数，这样就不需要复杂的 shell 重定向了
 		winArgs := append(args, "-logfile", logPath)
-		cliArgs := windowsArgumentList(winArgs)
+		launcherPath := filepath.Join(s.configDir, "launch-daemon.cmd")
+		if err := writeWindowsLauncher(launcherPath, startupLogPath, binPath, winArgs); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("failed to write daemon launcher: %v", err)
+		}
 
 		s.logf("Windows: 正在尝试以管理员权限启动 P2P 核心...")
-		// 使用单引号包裹路径以处理空格
-		powershellCmd := fmt.Sprintf("Start-Process '%s' -ArgumentList '%s' -Verb RunAs -WindowStyle Hidden", binPath, cliArgs)
+		powershellCmd := "Start-Process 'cmd.exe' -ArgumentList " + powershellSingleQuote("/c "+windowsBatchQuote(launcherPath)) + " -Verb RunAs -WindowStyle Hidden"
 		cmd = exec.Command("powershell", "-Command", powershellCmd)
 
 		if err := cmd.Run(); err != nil {
@@ -212,12 +224,26 @@ func (s *VPNService) Start(bootstrapAddr string) error {
 		// 启动一个虚拟进程用于维持生命周期管理
 		s.cmd = exec.Command(binPath)
 		go s.tailDaemonLog(logPath)
+		go s.tailStartupLog(startupLogPath)
 		return nil
 	} else if runtime.GOOS == "darwin" {
-		os.Remove(logPath)
+		if err := resetLogFile(logPath); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("failed to prepare daemon log: %v", err)
+		}
+		if err := resetLogFile(startupLogPath); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("failed to prepare startup log: %v", err)
+		}
 
 		daemonArgs := append(args, "-logfile", logPath)
-		cliCmd := "nohup " + shellCommand(binPath, daemonArgs) + " >/dev/null 2>&1 &"
+		launcherPath := filepath.Join(s.configDir, "launch-daemon.sh")
+		if err := writeUnixLauncher(launcherPath, startupLogPath, logPath, binPath, daemonArgs); err != nil {
+			s.setState(StateError)
+			return fmt.Errorf("failed to write daemon launcher: %v", err)
+		}
+
+		cliCmd := "nohup /bin/sh " + shellQuote(launcherPath) + " >/dev/null 2>&1 &"
 		script := fmt.Sprintf("do shell script %q with administrator privileges", cliCmd)
 
 		s.logf("macOS: 正在请求管理员权限启动 P2P 核心...")
@@ -229,6 +255,7 @@ func (s *VPNService) Start(bootstrapAddr string) error {
 
 		s.cmd = exec.Command(binPath)
 		go s.tailDaemonLog(logPath)
+		go s.tailStartupLog(startupLogPath)
 		return nil
 	} else {
 		// Linux: use pkexec
@@ -301,7 +328,7 @@ func (s *VPNService) Stop() {
 func (s *VPNService) tailDaemonLog(path string) {
 	s.logf("日志文件: %s", path)
 	// 等待文件创建
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 60; i++ {
 		if _, err := os.Stat(path); err == nil {
 			break
 		}
@@ -322,6 +349,51 @@ func (s *VPNService) tailDaemonLog(path string) {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			s.handleDaemonLogLine(line)
+		}
+
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			s.Lock()
+			running := s.state == StateConnecting || s.state == StateConnected
+			s.Unlock()
+			if !running {
+				break
+			}
+		}
+	}
+}
+
+func (s *VPNService) tailStartupLog(path string) {
+	s.logf("启动日志: %s", path)
+	for i := 0; i < 60; i++ {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		s.logf("无法打开启动日志: %v", err)
+		return
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line != "" {
+			s.logf("[launcher] %s", line)
+			if code, ok := launcherExitCode(line); ok && code != 0 {
+				s.Lock()
+				running := s.state == StateConnecting || s.state == StateConnected
+				s.Unlock()
+				if running {
+					s.setState(StateError)
+					s.logf("P2P 核心提前退出，退出码=%d。", code)
+				}
+			}
 		}
 
 		if err != nil {
@@ -384,6 +456,52 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+func resetLogFile(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func writeUnixLauncher(path, startupLogPath, daemonLogPath, binPath string, args []string) error {
+	content := "#!/bin/sh\n" +
+		"umask 022\n" +
+		"{\n" +
+		"echo \"[startup] time=$(date '+%Y-%m-%d %H:%M:%S')\"\n" +
+		"echo " + shellQuote("[startup] binary="+binPath) + "\n" +
+		"echo " + shellQuote("[startup] logfile="+daemonLogPath) + "\n" +
+		"if [ ! -x " + shellQuote(binPath) + " ]; then\n" +
+		"  echo " + shellQuote("[startup] binary is not executable") + "\n" +
+		"  exit 126\n" +
+		"fi\n" +
+		shellCommand(binPath, args) + "\n" +
+		"code=$?\n" +
+		"echo \"[startup] exit_code=${code}\"\n" +
+		"exit ${code}\n" +
+		"} >> " + shellQuote(startupLogPath) + " 2>&1\n"
+	return os.WriteFile(path, []byte(content), 0755)
+}
+
+func writeWindowsLauncher(path, startupLogPath, binPath string, args []string) error {
+	logPath := windowsBatchQuote(startupLogPath)
+	content := "@echo off\r\n" +
+		"echo [startup] time=%DATE% %TIME%>> " + logPath + "\r\n" +
+		"echo [startup] binary=" + binPath + ">> " + logPath + "\r\n" +
+		"if not exist " + windowsBatchQuote(binPath) + " (\r\n" +
+		"  echo [startup] binary missing>> " + logPath + "\r\n" +
+		"  exit /b 126\r\n" +
+		")\r\n" +
+		windowsBatchQuote(binPath) + " " + windowsArgumentList(args) + " >> " + logPath + " 2>&1\r\n" +
+		"set code=%ERRORLEVEL%\r\n" +
+		"echo [startup] exit_code=%code%>> " + logPath + "\r\n" +
+		"exit /b %code%\r\n"
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
 func windowsArgumentList(args []string) string {
 	quoted := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -400,6 +518,27 @@ func windowsArgQuote(s string) string {
 		return s
 	}
 	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+func windowsBatchQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+}
+
+func powershellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func launcherExitCode(line string) (int, bool) {
+	const marker = "exit_code="
+	idx := strings.LastIndex(line, marker)
+	if idx < 0 {
+		return 0, false
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(line[idx+len(marker):]))
+	if err != nil {
+		return 0, false
+	}
+	return code, true
 }
 
 func sanitizeLogMessage(msg string) string {

@@ -59,6 +59,10 @@ if [[ "$INTERACTIVE" == "true" ]]; then
   echo ""
 fi
 
+if [[ "$RELAY" != "true" && -z "$BOOTSTRAP_ADDR" ]]; then
+  error "客户端模式必须指定引导节点: --bootstrap ADDR；如果本机是公网引导节点，请使用 --relay"
+fi
+
 [[ $EUID -ne 0 ]] && error "请使用 sudo 运行"
 
 # 架构检测
@@ -97,7 +101,7 @@ CONFIG_DIR=${CONFIG_DIR}/data
 RELAY=${RELAY}
 BOOTSTRAP_ADDR=${BOOTSTRAP_ADDR}
 EOF
-chmod 600 "${ENV_FILE}"
+chmod 644 "${ENV_FILE}"
 
 # 4. 生成 LaunchDaemon Plist
 info "正在创建 LaunchDaemon 服务 ..."

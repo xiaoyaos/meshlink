@@ -33,6 +33,10 @@ if ($bootstrap -eq "" -and $relay.IsPresent -eq $false) {
     Write-Host ""
 }
 
+if ([string]::IsNullOrWhiteSpace($bootstrap) -and $relay.IsPresent -eq $false) {
+    Write-Error "Client mode requires bootstrap address. Use -bootstrap <ADDR>, or use -relay for bootstrap/relay node."
+}
+
 $installDir = "C:\Program Files\MeshLink"
 $binName = "p2p-node.exe"
 $dllName = "wintun.dll"
@@ -61,7 +65,7 @@ if (-not (Test-Path "$installDir\data")) {
 }
 
 Write-Host "[INFO] Creating scheduled task..." -ForegroundColor Cyan
-$taskArgs = "-port $port -config `"$installDir\data`""
+$taskArgs = "-port $port -config `"$installDir\data`" -logfile `"$installDir\meshlink.log`""
 if ($relay) {
     $taskArgs = "$taskArgs -relay"
 }
