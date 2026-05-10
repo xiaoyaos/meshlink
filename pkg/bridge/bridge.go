@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -487,6 +488,9 @@ func (b *Bridge) handleOutgoingPacket(data []byte) {
 		if !strings.HasPrefix(dstIP, "10.") {
 			return
 		}
+		if isNoisyLocalIPv4(ip.DstIP) {
+			return
+		}
 
 		if b.shouldLog("bridge:out-start:"+dstIP, time.Second) {
 			fmt.Printf("[路由] 正在寻址: %s\n", dstIP)
@@ -510,6 +514,14 @@ func (b *Bridge) handleOutgoingPacket(data []byte) {
 			fmt.Printf("[网桥] 已发包: 目标=%s 长度=%d\n", dstIP, len(data))
 		}
 	}
+}
+
+func isNoisyLocalIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return true
+	}
+	return ip4[0] == 0 || ip4[0] >= 224 || ip4[3] == 0 || ip4[3] == 255
 }
 
 func (b *Bridge) newControlStream(target peer.ID, timeout time.Duration) (network.Stream, error) {

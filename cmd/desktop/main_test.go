@@ -109,3 +109,19 @@ func TestNormalizeLogLines(t *testing.T) {
 		t.Fatalf("normalizeLogLines() = %#v, want %#v", got, want)
 	}
 }
+
+func TestNormalizeRepeatingLogLineIgnoresTimePrefix(t *testing.T) {
+	got := normalizeRepeatingLogLine("12:34:56  [控制] 映射成功: 10.0.0.2 -> peer")
+	want := "[控制] 映射成功: 10.0.0.2 -> peer"
+	if got != want {
+		t.Fatalf("normalizeRepeatingLogLine() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeRepeatingLogLineIgnoresAggregateSuffix(t *testing.T) {
+	got := normalizeRepeatingLogLine("[控制] 映射成功: 10.0.0.2 -> peer  |  共 12 次")
+	want := "[控制] 映射成功: 10.0.0.2 -> peer"
+	if got != want {
+		t.Fatalf("normalizeRepeatingLogLine() = %q, want %q", got, want)
+	}
+}

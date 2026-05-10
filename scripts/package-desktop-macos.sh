@@ -6,6 +6,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_BIN="${ROOT_DIR}/dist/bin"
 SCRIPTS_DIR="${ROOT_DIR}/scripts"
+ICON_DIR="${ROOT_DIR}/assets/icon"
 OUTPUT_DIR="${ROOT_DIR}/dist/desktop/macos"
 VERSION="${1:-1.0.0}"
 GO_LDFLAGS="${GO_LDFLAGS:--s -w}"
@@ -18,6 +19,10 @@ RES_DIR="${APP_DIR}/Contents/Resources"
 BUILD_DIR="${OUTPUT_DIR}/.build-${VERSION}"
 
 mkdir -p "${MACOS_DIR}" "${RES_DIR}" "${BUILD_DIR}"
+
+if [[ ! -f "${ICON_DIR}/meshlink-icon.icns" ]]; then
+  bash "${SCRIPTS_DIR}/build-icons.sh"
+fi
 
 CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
   go build -buildvcs=false -ldflags="${GO_LDFLAGS} -X 'main.Version=${VERSION}'" \
@@ -39,6 +44,7 @@ cp "${DIST_BIN}/p2p-node-darwin-amd64" "${RES_DIR}/"
 cp "${SCRIPTS_DIR}/install-macos.sh" "${RES_DIR}/"
 cp "${SCRIPTS_DIR}/uninstall-macos.sh" "${RES_DIR}/"
 cp "${SCRIPTS_DIR}/meshlink.sh" "${RES_DIR}/"
+cp "${ICON_DIR}/meshlink-icon.icns" "${RES_DIR}/MeshLink.icns"
 
 cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -55,6 +61,8 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
   <string>6.0</string>
   <key>CFBundleName</key>
   <string>MeshLink Desktop</string>
+  <key>CFBundleIconFile</key>
+  <string>MeshLink</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
