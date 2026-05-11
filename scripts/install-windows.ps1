@@ -57,8 +57,12 @@ if (Test-Path "$PSScriptRoot\meshlink.cmd") {
 }
 
 $envFile = "$installDir\meshlink.env"
-$envContent = "PORT=$port`nCONFIG_DIR=$installDir\data`nRELAY=$($relay.ToString().ToLower())`nBOOTSTRAP_ADDR=$bootstrap"
-Set-Content -Path $envFile -Value $envContent -Encoding ASCII
+@{
+    PORT = $port
+    CONFIG_DIR = "$installDir\data"
+    RELAY = $relay.ToString().ToLowerInvariant()
+    BOOTSTRAP_ADDR = $bootstrap
+} | ConvertTo-Json -Depth 2 | Set-Content -Path $envFile -Encoding UTF8
 
 if (-not (Test-Path "$installDir\data")) {
     New-Item -ItemType Directory -Path "$installDir\data" | Out-Null

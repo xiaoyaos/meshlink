@@ -5,6 +5,7 @@ OS=$(uname -s)
 COMMAND=$1
 ADDR_FILE="/etc/meshlink/data/address.txt"
 STATE_FILE="/etc/meshlink/data/state.json"
+RECONNECT_FILE="/etc/meshlink/data/reconnect.request"
 
 show_help() {
     echo -e "\033[1;32mMeshLink P2P 虚拟网状网络管理工具\033[0m"
@@ -18,6 +19,7 @@ show_help() {
     echo "  restart     重启 MeshLink 后台服务"
     echo "  logs        查看实时运行日志 (Ctrl+C 退出)"
     echo "  test <IP>   测试与指定虚拟 IP 的 P2P 链路延迟"
+    echo "  reconnect [IP|all]  手动触发直连重试"
     echo ""
     echo "其他:"
     echo "  -h, --help  显示此帮助信息"
@@ -63,8 +65,8 @@ case "$COMMAND" in
 
             echo ""
             echo -e "\033[1;33m[ 已连接的对等节点 ]\033[0m"
-            echo -e "  \033[1m虚拟 IP        连接方式    节点 ID\033[0m"
-            python3 -c "import json; s=json.load(open('$STATE_FILE')); [print(f'  {v:<15} {\"直连\" if p[\"direct\"] else \"中继\":<8} {p[\"id\"]}') for v,p in s[\"peers\"].items()]" 2>/dev/null || echo "  (暂无在线节点)"
+            echo -e "  \033[1m虚拟 IP        连接方式    系统       主机名              节点 ID\033[0m"
+            python3 -c "import json; s=json.load(open('$STATE_FILE')); peers=s.get('peers', {}); [print(f'  {v:<15} {(\"直连\" if p.get(\"direct\") else (\"中继\" if p.get(\"connected\", True) else \"离线\")):<8} {p.get(\"os\") or \"-\":<10} {(p.get(\"hostname\") or \"-\")[:18]:<18} {p.get(\"id\", \"-\")}') for v,p in peers.items()] or print('  (暂无在线节点)')" 2>/dev/null || echo "  (暂无在线节点)"
             
             echo ""
             echo -e "\033[1;35m[ 简写地址 (复制给他人使用) ]\033[0m"
@@ -93,6 +95,11 @@ case "$COMMAND" in
         fi
         echo -e "\033[1;34m[测试] 正在测试到 $TARGET 的 P2P 链路延迟...\033[0m"
         ping -c 4 "$TARGET"
+        ;;
+    reconnect)
+        TARGET=${2:-all}
+        printf '%s\n' "$TARGET" | sudo tee "$RECONNECT_FILE" >/dev/null
+        echo "已请求 MeshLink 尝试直连重连: $TARGET"
         ;;
     start)
         if [[ "$OS" == "Darwin" ]]; then
@@ -124,7 +131,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "MeshLink 管理工具"
-        echo "用法: meshlink {stats|start|stop|restart|logs}"
+        echo "用法: meshlink {stats|start|stop|restart|logs|test|reconnect}"
         exit 1
         ;;
 esac

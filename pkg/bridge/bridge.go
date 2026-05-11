@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -26,14 +27,19 @@ const (
 	providerQueryLimit = 8
 	providerQueryTime  = 12 * time.Second
 	fastAdvertiseCount = 12
+	reconnectFileName  = "reconnect.request"
 )
 
 // PeerInfo 存储单个对等节点的状态
 type PeerInfo struct {
-	VIP      string `json:"vip"`
-	ID       string `json:"id"`
-	Direct   bool   `json:"direct"`
-	LastSeen string `json:"last_seen"`
+	VIP       string `json:"vip"`
+	ID        string `json:"id"`
+	Direct    bool   `json:"direct"`
+	Connected bool   `json:"connected"`
+	OS        string `json:"os,omitempty"`
+	Hostname  string `json:"hostname,omitempty"`
+	Version   string `json:"version,omitempty"`
+	LastSeen  string `json:"last_seen"`
 }
 
 // GlobalState 存储整个节点的运行状态
@@ -60,13 +66,23 @@ type Bridge struct {
 
 	// routeCache 缓存 虚拟IP -> PeerID 的映射
 	routeCache sync.Map // map[string]peer.ID
+	peerMeta   sync.Map // map[peer.ID]peerMeta
 	resolving  sync.Map // map[string]*routeResolveCall
+	reconnect  sync.Map // map[peer.ID]time.Time
 }
 
 type routeResolveCall struct {
 	done chan struct{}
 	peer peer.ID
 	err  error
+}
+
+type peerMeta struct {
+	VIP      string `json:"vip"`
+	ID       peer.ID
+	OS       string `json:"os,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	Version  string `json:"version,omitempty"`
 }
 
 func New(t *tun.Interface, n *p2p.Node, configDir string, version string) *Bridge {
@@ -130,8 +146,7 @@ func (b *Bridge) sendLocalVIP(target peer.ID) error {
 			continue
 		}
 
-		// 格式: "HELLO:<IP>:<PeerID>"
-		msg := fmt.Sprintf("HELLO:%s:%s", b.tun.IP.String(), b.node.Host.ID().String())
+		msg := b.controlMessage("HELLO", b.tun.IP.String(), b.node.Host.ID())
 		_, err = s.Write([]byte(msg))
 		s.Close()
 
@@ -161,7 +176,7 @@ func (b *Bridge) syncRegistryToPeer(target peer.ID) {
 					return
 				}
 				defer s.Close()
-				msg := fmt.Sprintf("HELLO:%s:%s", v, o.String())
+				msg := b.controlMessage("HELLO", v, o)
 				_, _ = s.Write([]byte(msg))
 			}(vip, owner)
 			return true
@@ -188,37 +203,27 @@ func (b *Bridge) handleControlStream(s network.Stream) {
 	cmd := parts[0]
 	switch cmd {
 	case "HELLO":
-		// 收到对方宣告: HELLO:VIP:PeerID
-		if len(parts) < 3 {
+		meta, ok := b.parsePeerMeta(parts)
+		if !ok {
 			return
 		}
-		vip, ownerIDStr := parts[1], parts[2]
-		ownerID, err := peer.Decode(ownerIDStr)
-		if err != nil {
-			return
-		}
-		b.updateRoute(vip, ownerID)
+		b.updateRoute(meta.VIP, meta.ID, meta)
 
 		// 立即回复自己的信息 (WELCOME)
-		resp := fmt.Sprintf("WELCOME:%s:%s", b.tun.IP.String(), b.node.Host.ID().String())
+		resp := b.controlMessage("WELCOME", b.tun.IP.String(), b.node.Host.ID())
 		_, _ = s.Write([]byte(resp))
 
 		// 如果自己是服务器，额外同步其他人的信息
 		if b.node.Relay != nil {
-			go b.broadcastVIPInfo(vip, ownerID)
+			go b.broadcastVIPInfo(meta.VIP, meta.ID)
 		}
 
 	case "WELCOME":
-		// 收到回应: WELCOME:VIP:PeerID
-		if len(parts) < 3 {
+		meta, ok := b.parsePeerMeta(parts)
+		if !ok {
 			return
 		}
-		vip, ownerIDStr := parts[1], parts[2]
-		ownerID, err := peer.Decode(ownerIDStr)
-		if err != nil {
-			return
-		}
-		b.updateRoute(vip, ownerID)
+		b.updateRoute(meta.VIP, meta.ID, meta)
 
 	case "PING":
 		// 内置诊断协议: PING:请求ID
@@ -237,21 +242,80 @@ func (b *Bridge) handleControlStream(s network.Stream) {
 	}
 }
 
-func (b *Bridge) updateRoute(vip string, id peer.ID) {
+func (b *Bridge) controlMessage(cmd, vip string, id peer.ID) string {
+	var meta peerMeta
+	if id == b.node.Host.ID() {
+		meta = b.localPeerMeta(vip, id)
+	} else if v, ok := b.peerMeta.Load(id); ok {
+		meta = v.(peerMeta)
+		meta.VIP = firstNonEmpty(meta.VIP, vip)
+		meta.ID = id
+	} else {
+		meta = peerMeta{VIP: vip, ID: id}
+	}
+	fields := []string{cmd, meta.VIP, meta.ID.String(), meta.OS, meta.Hostname, meta.Version}
+	for i := range fields {
+		fields[i] = strings.ReplaceAll(fields[i], ":", "_")
+	}
+	return strings.Join(fields, ":")
+}
+
+func (b *Bridge) parsePeerMeta(parts []string) (peerMeta, bool) {
+	if len(parts) < 3 {
+		return peerMeta{}, false
+	}
+	ownerID, err := peer.Decode(parts[2])
+	if err != nil {
+		return peerMeta{}, false
+	}
+	meta := peerMeta{
+		VIP: strings.TrimSpace(parts[1]),
+		ID:  ownerID,
+	}
+	if len(parts) > 3 {
+		meta.OS = strings.TrimSpace(parts[3])
+	}
+	if len(parts) > 4 {
+		meta.Hostname = strings.TrimSpace(parts[4])
+	}
+	if len(parts) > 5 {
+		meta.Version = strings.TrimSpace(parts[5])
+	}
+	return meta, meta.VIP != ""
+}
+
+func (b *Bridge) localPeerMeta(vip string, id peer.ID) peerMeta {
+	host, _ := os.Hostname()
+	return peerMeta{
+		VIP:      vip,
+		ID:       id,
+		OS:       runtime.GOOS,
+		Hostname: host,
+		Version:  b.version,
+	}
+}
+
+func (b *Bridge) updateRoute(vip string, id peer.ID, meta peerMeta) {
 	if b.shouldLog("route:learned:"+vip, time.Minute) {
 		fmt.Printf("[控制] 映射成功: %s -> %s\n", vip, id)
 	}
 	b.routeCache.Store(vip, id)
+	if meta.ID != "" {
+		if meta.VIP == "" {
+			meta.VIP = vip
+		}
+		b.peerMeta.Store(id, meta)
+	}
 
 	// 如果对方不是服务器，尝试打洞直连
 	if b.node.Relay == nil && id != b.node.Host.ID() {
-		go b.node.EnsureDirectConn(id)
+		b.scheduleReconnect(id)
 	}
 }
 
 func (b *Bridge) broadcastVIPInfo(vip string, owner peer.ID) {
 	peers := b.node.Host.Network().Peers()
-	msg := fmt.Sprintf("HELLO:%s:%s", vip, owner.String())
+	msg := b.controlMessage("HELLO", vip, owner)
 	for _, p := range peers {
 		if p == owner || p == b.node.Host.ID() {
 			continue
@@ -314,6 +378,12 @@ func (b *Bridge) Start() {
 
 	// 5. 定期更新实时状态文件供 CLI 工具查看 (包含僵尸路由清理)
 	go b.stateUpdateLoop()
+
+	// 6. 处理 CLI/桌面端发来的手动重连请求
+	go b.commandLoop()
+
+	// 7. 后台持续尝试把 relay 连接升级为直连
+	go b.reconnectLoop()
 }
 
 func (b *Bridge) stateUpdateLoop() {
@@ -350,8 +420,8 @@ func (b *Bridge) pruneStaleRoutes() {
 		vip := key.(string)
 		ownerID := value.(peer.ID)
 
-		// 如果该 Peer 已经不在连接列表中，且不是自己，则剔除
-		if !activePeers[ownerID] && ownerID.String() != b.node.Host.ID().String() {
+		// 引导/中继节点需要清理真实下线节点；普通客户端保留已学习的 VIP 映射，方便后续重连恢复。
+		if b.node.Relay != nil && !activePeers[ownerID] && ownerID.String() != b.node.Host.ID().String() {
 			if b.shouldLog("prune:"+vip, time.Minute) {
 				fmt.Printf("[路由] 检测到离线僵尸路由，正在剔除: %s -> %s\n", vip, ownerID)
 			}
@@ -384,20 +454,22 @@ func (b *Bridge) writeStateFile() {
 			return true
 		}
 
-		// 检查连接类型
-		isDirect := false
-		for _, conn := range b.node.Host.Network().ConnsToPeer(ownerID) {
-			if !conn.Stat().Limited && !strings.Contains(conn.RemoteMultiaddr().String(), "p2p-circuit") {
-				isDirect = true
-				break
-			}
+		connected := b.node.HasConn(ownerID)
+		isDirect := b.node.HasDirectConn(ownerID)
+		meta := peerMeta{}
+		if v, ok := b.peerMeta.Load(ownerID); ok {
+			meta = v.(peerMeta)
 		}
 
 		state.Peers[vip] = PeerInfo{
-			VIP:      vip,
-			ID:       ownerID.String(),
-			Direct:   isDirect,
-			LastSeen: time.Now().Format("15:04:05"),
+			VIP:       vip,
+			ID:        ownerID.String(),
+			Direct:    isDirect,
+			Connected: connected,
+			OS:        meta.OS,
+			Hostname:  meta.Hostname,
+			Version:   meta.Version,
+			LastSeen:  time.Now().Format("15:04:05"),
 		}
 		return true
 	})
@@ -422,6 +494,49 @@ func (b *Bridge) periodicAnnounceLoop() {
 			for _, p := range peers {
 				go b.sendLocalVIP(p)
 			}
+		case <-b.ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *Bridge) commandLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	lastMod := time.Time{}
+	path := filepath.Join(b.configDir, reconnectFileName)
+
+	for {
+		select {
+		case <-ticker.C:
+			info, err := os.Stat(path)
+			if err != nil || !info.ModTime().After(lastMod) {
+				continue
+			}
+			lastMod = info.ModTime()
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			target := strings.TrimSpace(string(data))
+			if target == "" {
+				target = "all"
+			}
+			go b.reconnectTarget(target, "manual")
+		case <-b.ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *Bridge) reconnectLoop() {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.reconnectTarget("all", "auto")
 		case <-b.ctx.Done():
 			return
 		}
@@ -504,9 +619,7 @@ func (b *Bridge) handleOutgoingPacket(data []byte) {
 		}
 
 		if err := b.node.SendPacket(peerID, data); err != nil {
-			if cached, ok := b.routeCache.Load(dstIP); ok && cached.(peer.ID) == peerID {
-				b.routeCache.Delete(dstIP)
-			}
+			b.scheduleReconnect(peerID)
 			if b.shouldLog("send:"+dstIP, 10*time.Second) {
 				fmt.Printf("[隧道] 发送失败 目标=%s 节点=%s 错误=%v\n", dstIP, peerID, err)
 			}
@@ -514,6 +627,82 @@ func (b *Bridge) handleOutgoingPacket(data []byte) {
 			fmt.Printf("[网桥] 已发包: 目标=%s 长度=%d\n", dstIP, len(data))
 		}
 	}
+}
+
+func (b *Bridge) scheduleReconnect(target peer.ID) {
+	if target == "" || target == b.node.Host.ID() {
+		return
+	}
+	if lastValue, ok := b.reconnect.Load(target); ok {
+		if time.Since(lastValue.(time.Time)) < 12*time.Second {
+			return
+		}
+	}
+	b.reconnect.Store(target, time.Now())
+	go func() {
+		if err := b.node.ReconnectPeer(target); err != nil {
+			if b.shouldLog("reconnect:"+target.String(), 20*time.Second) {
+				fmt.Printf("[重连] 直连尝试未完成: 节点=%s 错误=%v\n", target, err)
+			}
+			return
+		}
+		if b.shouldLog("reconnect-ok:"+target.String(), time.Minute) {
+			fmt.Printf("[重连] 已尝试刷新直连链路: 节点=%s\n", target)
+		}
+	}()
+}
+
+func (b *Bridge) reconnectTarget(target, source string) {
+	target = strings.TrimSpace(target)
+	if target == "" || strings.EqualFold(target, "all") {
+		count := 0
+		b.routeCache.Range(func(_ any, value any) bool {
+			id := value.(peer.ID)
+			if id != b.node.Host.ID() {
+				b.scheduleReconnect(id)
+				count++
+			}
+			return true
+		})
+		if b.shouldLog("reconnect-request:"+source+":all", 3*time.Second) {
+			fmt.Printf("[重连] 已接收%s重连请求: all (%d 个节点)\n", reconnectSourceText(source), count)
+		}
+		return
+	}
+
+	var id peer.ID
+	if v, ok := b.routeCache.Load(target); ok {
+		id = v.(peer.ID)
+	} else if decoded, err := peer.Decode(target); err == nil {
+		id = decoded
+	}
+	if id == "" {
+		if b.shouldLog("reconnect-miss:"+target, 5*time.Second) {
+			fmt.Printf("[重连] 找不到目标: %s\n", target)
+		}
+		return
+	}
+	if b.shouldLog("reconnect-request:"+source+":"+target, 3*time.Second) {
+		fmt.Printf("[重连] 已接收%s重连请求: %s -> %s\n", reconnectSourceText(source), target, id)
+	}
+	b.scheduleReconnect(id)
+}
+
+func reconnectSourceText(source string) string {
+	if source == "manual" {
+		return "手动"
+	}
+	return "自动"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func isNoisyLocalIPv4(ip net.IP) bool {

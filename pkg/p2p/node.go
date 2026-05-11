@@ -228,29 +228,68 @@ func (n *Node) AddrCounts() (int, int) {
 	return len(directAddrs), len(relayedAddrs)
 }
 
-// EnsureDirectConn 尝试与目标节点建立连接，优先尝试直连。
+// EnsureDirectConn 尝试与目标节点建立连接，优先尝试直连；如果只能通过 relay 建立可用隧道，也允许兜底。
 func (n *Node) EnsureDirectConn(target peer.ID) error {
+	return n.ensureConn(target, false)
+}
+
+// ReconnectPeer 清理已缓存的数据流并主动尝试升级为直连连接。
+func (n *Node) ReconnectPeer(target peer.ID) error {
+	n.ClearStream(target)
+	err := n.ensureConn(target, true)
+	if err == nil {
+		return nil
+	}
+	if n.bestConn(target) == nil {
+		if fallbackErr := n.ensureConn(target, false); fallbackErr != nil {
+			return fmt.Errorf("%w; relay fallback failed: %v", err, fallbackErr)
+		}
+	}
+	return err
+}
+
+// HasConn 返回当前是否与目标节点存在任意连接。
+func (n *Node) HasConn(target peer.ID) bool {
+	return n.bestConn(target) != nil
+}
+
+// HasDirectConn 返回当前是否与目标节点存在非 relay 直连连接。
+func (n *Node) HasDirectConn(target peer.ID) bool {
+	return n.directConn(target) != nil
+}
+
+// ClearStream 清理目标节点的缓存数据流，使后续发包重新选择最新连接。
+func (n *Node) ClearStream(target peer.ID) {
+	if v, ok := n.streams.LoadAndDelete(target); ok {
+		_ = v.(network.Stream).Reset()
+	}
+}
+
+func (n *Node) ensureConn(target peer.ID, requireDirect bool) error {
 	existing := n.bestConn(target)
 	if existing != nil && isDirectConn(existing) {
 		return nil
 	}
 
 	info := n.Host.Peerstore().PeerInfo(target)
-	if len(info.Addrs) == 0 && n.DHT != nil {
+	if n.DHT != nil && (len(info.Addrs) == 0 || requireDirect) {
 		ctx, cancel := context.WithTimeout(n.Ctx, 15*time.Second)
 		found, err := n.DHT.FindPeer(ctx, target)
 		cancel()
-		if err != nil {
-			if existing != nil {
+		if err == nil && len(found.Addrs) > 0 {
+			info = found
+		} else if len(info.Addrs) == 0 {
+			if existing != nil && !requireDirect {
 				return nil
 			}
-			return fmt.Errorf("find peer addresses: %w", err)
+			if err != nil {
+				return fmt.Errorf("find peer addresses: %w", err)
+			}
 		}
-		info = found
 	}
 
 	if len(info.Addrs) == 0 {
-		if existing != nil {
+		if existing != nil && !requireDirect {
 			return nil
 		}
 		return fmt.Errorf("no addresses for peer %s", target)
@@ -268,12 +307,20 @@ func (n *Node) EnsureDirectConn(target peer.ID) error {
 		if err == nil {
 			if c := n.directConn(target); c != nil {
 				n.logDirectReady(target, c, "direct")
+				n.ClearStream(target)
 				return nil
 			}
 			directErr = fmt.Errorf("direct dial completed without a direct connection")
 		} else {
 			directErr = err
 		}
+	}
+
+	if requireDirect {
+		if directErr != nil {
+			return fmt.Errorf("direct reconnect failed: %w", directErr)
+		}
+		return fmt.Errorf("no direct addresses for peer %s", target)
 	}
 
 	if c := n.bestConn(target); c != nil {
@@ -300,6 +347,7 @@ func (n *Node) EnsureDirectConn(target peer.ID) error {
 	if c := n.bestConn(target); c != nil {
 		if isDirectConn(c) {
 			n.logDirectReady(target, c, "hole-punch")
+			n.ClearStream(target)
 		}
 		return nil
 	}
@@ -309,7 +357,12 @@ func (n *Node) EnsureDirectConn(target peer.ID) error {
 
 func (n *Node) getStream(target peer.ID) (network.Stream, error) {
 	if v, ok := n.streams.Load(target); ok {
-		return v.(network.Stream), nil
+		s := v.(network.Stream)
+		if isDirectConn(s.Conn()) || n.directConn(target) == nil {
+			return s, nil
+		}
+		n.streams.CompareAndDelete(target, s)
+		_ = s.Reset()
 	}
 
 	if err := n.EnsureDirectConn(target); err != nil {

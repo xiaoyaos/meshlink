@@ -7,6 +7,7 @@ param (
 $installDir = "C:\Program Files\MeshLink"
 $addrFile = "$installDir\data\address.txt"
 $stateFile = "$installDir\data\state.json"
+$reconnectFile = "$installDir\data\reconnect.request"
 
 function Show-Help {
     Write-Host "MeshLink Windows manager" -ForegroundColor Green
@@ -19,6 +20,7 @@ function Show-Help {
     Write-Host "  stop            Stop MeshLink task and process"
     Write-Host "  restart         Restart MeshLink task"
     Write-Host "  test <ip>       Ping a virtual IP"
+    Write-Host "  reconnect [ip|all]  Ask the core to retry direct P2P dialing"
     Write-Host "  -h, --help      Show help"
 }
 
@@ -60,11 +62,14 @@ switch ($command) {
 
             Write-Host ""
             Write-Host "[ Peers ]" -ForegroundColor Yellow
-            Write-Host "  Virtual IP        Mode      Peer ID"
+            Write-Host "  Virtual IP        Mode      OS         Hostname           Peer ID"
             foreach ($vip in $state.peers.PSObject.Properties.Name) {
                 $p = $state.peers.$vip
-                $mode = if ($p.direct) { "direct" } else { "relay" }
-                Write-Host "  $($vip.PadRight(17)) $($mode.PadRight(9)) $($p.id)"
+                $mode = if ($p.direct) { "direct" } elseif ($p.connected -ne $false) { "relay" } else { "offline" }
+                $peerOS = if ($p.os) { $p.os } else { "-" }
+                $hostname = if ($p.hostname) { $p.hostname } else { "-" }
+                if ($hostname.Length -gt 16) { $hostname = $hostname.Substring(0, 16) }
+                Write-Host "  $($vip.PadRight(17)) $($mode.PadRight(9)) $($peerOS.PadRight(10)) $($hostname.PadRight(18)) $($p.id)"
             }
         }
 
@@ -86,6 +91,14 @@ switch ($command) {
         }
         Write-Host "[TEST] Pinging $target ..." -ForegroundColor Blue
         ping -n 4 $target
+    }
+    "reconnect" {
+        $value = if ([string]::IsNullOrWhiteSpace($target)) { "all" } else { $target.Trim() }
+        if (-not (Test-Path "$installDir\data")) {
+            New-Item -ItemType Directory -Path "$installDir\data" | Out-Null
+        }
+        Set-Content -Path $reconnectFile -Value $value -Encoding UTF8
+        Write-Host "MeshLink reconnect requested: $value"
     }
     "start" {
         Start-ScheduledTask -TaskName "MeshLink"

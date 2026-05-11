@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,9 +33,10 @@ const (
 	modeClient        = "客户端"
 	modeRelay         = "引导/中继"
 	logTailLines      = 200
-	defaultWindowWide = 1100
-	defaultWindowHigh = 760
-	logPanelHigh      = 112
+	defaultWindowWide = 960
+	defaultWindowHigh = 680
+	panelMinHigh      = 176
+	logPanelHigh      = 64
 )
 
 var (
@@ -68,6 +71,7 @@ type desktopApp struct {
 	updatedAt       *widget.Label
 	vip             *widget.Entry
 	peerID          *widget.Entry
+	peerList        *fyne.Container
 	config          *widget.Entry
 	installConf     *widget.Entry
 	logFile         *widget.Entry
@@ -108,10 +112,14 @@ type meshState struct {
 }
 
 type peerInfo struct {
-	VIP      string `json:"vip"`
-	ID       string `json:"id"`
-	Direct   bool   `json:"direct"`
-	LastSeen string `json:"last_seen"`
+	VIP       string `json:"vip"`
+	ID        string `json:"id"`
+	Direct    bool   `json:"direct"`
+	Connected bool   `json:"connected"`
+	OS        string `json:"os"`
+	Hostname  string `json:"hostname"`
+	Version   string `json:"version"`
+	LastSeen  string `json:"last_seen"`
 }
 
 type meshTheme struct{}
@@ -229,11 +237,18 @@ type systemController interface {
 	Start() error
 	Stop() error
 	Restart() error
+	Reconnect(target string) error
+	Test(target string) (string, error)
 	Status() installStatus
 	ReadRecentLogs(lines int) string
 }
 
 func main() {
+	if err := ensureWindowsAdmin(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to request administrator privileges: %v\n", err)
+		return
+	}
+
 	a := app.NewWithID("com.meshlink.desktop")
 	a.Settings().SetTheme(meshTheme{})
 	w := a.NewWindow("MeshLink Desktop")
@@ -264,7 +279,7 @@ func (d *desktopApp) build() {
 	d.port.SetText("4001")
 
 	d.bootstrap = widget.NewEntry()
-	d.bootstrap.SetPlaceHolder("IP:端口:PeerID 或 /ip4/.../p2p/...")
+	d.bootstrap.SetPlaceHolder("引导节点地址")
 	d.mode.SetSelected(modeClient)
 
 	d.installed = widget.NewLabel("检测中")
@@ -278,12 +293,13 @@ func (d *desktopApp) build() {
 	d.updatedAt = widget.NewLabel("-")
 	d.vip = readonlyEntry()
 	d.peerID = readonlyEntry()
+	d.peerList = container.NewVBox()
 	d.config = readonlyEntry()
 	d.installConf = readonlyEntry()
 	d.logFile = readonlyEntry()
 	d.logs = widget.NewRichText()
 	d.logs.Wrapping = fyne.TextWrapOff
-	d.coreStatus = canvas.NewText("STANDBY", color.NRGBA{R: 0xff, G: 0xc8, B: 0x57, A: 0xff})
+	d.coreStatus = canvas.NewText("待机", color.NRGBA{R: 0xff, G: 0xc8, B: 0x57, A: 0xff})
 	d.coreStatus.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
 	d.coreStatus.TextSize = 22
 	d.coreMode = canvas.NewText("-", color.NRGBA{R: 0x8e, G: 0xef, B: 0xff, A: 0xff})
@@ -307,7 +323,7 @@ func (d *desktopApp) build() {
 		d.installButtonPressed()
 	})
 	d.installButton.Importance = widget.HighImportance
-	d.cancelButton = widget.NewButtonWithIcon("取消重装", theme.CancelIcon(), func() {
+	d.cancelButton = widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() {
 		d.reinstalling = false
 		d.refresh()
 		d.appendLog("已取消重新安装")
@@ -338,14 +354,7 @@ func (d *desktopApp) build() {
 }
 
 func (d *desktopApp) content() fyne.CanvasObject {
-	left := d.commandPanel()
-	mid := d.situationPanel()
-	right := d.installPanel()
-
-	rightSplit := container.NewHSplit(mid, right)
-	rightSplit.SetOffset(0.55)
-	center := container.NewHSplit(left, rightSplit)
-	center.SetOffset(0.24)
+	center := scrollPanel(d.situationPanel())
 
 	main := container.NewBorder(
 		d.headerPanel(),
@@ -364,22 +373,42 @@ func (d *desktopApp) content() fyne.CanvasObject {
 }
 
 func (d *desktopApp) headerPanel() fyne.CanvasObject {
-	title := canvas.NewText("MESHLINK COMMAND", color.NRGBA{R: 0xd8, G: 0xfb, B: 0xff, A: 0xff})
+	title := canvas.NewText("MeshLink 控制台", color.NRGBA{R: 0xd8, G: 0xfb, B: 0xff, A: 0xff})
 	title.TextStyle = fyne.TextStyle{Bold: true}
-	title.TextSize = 24
+	title.TextSize = 22
 
-	subtitle := canvas.NewText(fmt.Sprintf("P2P TUNNEL OPERATIONS  v%s  %s/%s", Version, runtime.GOOS, runtime.GOARCH), color.NRGBA{R: 0x67, G: 0xc7, B: 0xde, A: 0xff})
-	subtitle.TextSize = 12
+	subtitle := canvas.NewText(fmt.Sprintf("P2P 隧道运行中枢  v%s  %s/%s", Version, runtime.GOOS, runtime.GOARCH), color.NRGBA{R: 0x67, G: 0xc7, B: 0xde, A: 0xff})
+	subtitle.TextSize = 11
 	subtitle.TextStyle = fyne.TextStyle{Monospace: true}
 
 	brand := container.NewVBox(title, subtitle)
-	status := container.NewGridWithColumns(3,
-		statusTile("INSTALL", d.installed, d.installLamp),
-		statusTile("SERVICE", d.status, d.runningLamp),
-		statusTile("ROLE", d.nodeType, d.roleLamp),
+	serviceInfo := container.NewGridWithColumns(4,
+		consoleStatusTile("安装", d.installed, d.installLamp),
+		consoleStatusTile("服务", d.status, d.runningLamp),
+		consoleStatusTile("角色", d.nodeType, d.roleLamp),
+		consoleStatusTile("控制器", d.controller, nil),
+	)
+	serviceControls := container.NewGridWithColumns(4, d.startButton, d.stopButton, d.restartButton, d.refreshButton)
+
+	installControls := container.NewGridWithColumns(2, d.installButton, d.cancelButton)
+	installConfigTop := container.NewGridWithColumns(3,
+		controlGroup("模式", d.mode),
+		controlGroup("端口", d.port),
+		controlGroup("引导节点", d.bootstrap),
+	)
+	installConfigBottom := container.NewGridWithColumns(2,
+		controlGroup("当前配置", d.installConf),
+		controlGroup("安装", installControls),
 	)
 
-	headerBody := container.NewBorder(nil, nil, brand, nil, status)
+	headerTop := container.NewBorder(nil, nil, brand, nil, serviceControls)
+	headerBody := container.NewVBox(
+		headerTop,
+		serviceInfo,
+		hudDivider(),
+		installConfigTop,
+		installConfigBottom,
+	)
 	return hudPanel("", "", headerBody)
 }
 
@@ -396,47 +425,49 @@ func (d *desktopApp) commandPanel() fyne.CanvasObject {
 		hudDivider(),
 		installControls,
 	)
-	return hudPanel("COMMAND DECK", "primary controls", content)
+	return hudPanel("指令面板", "服务控制", content)
+}
+
+func controlGroup(label string, obj fyne.CanvasObject) fyne.CanvasObject {
+	caption := widget.NewLabelWithStyle(label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	return container.NewVBox(caption, obj)
 }
 
 func (d *desktopApp) situationPanel() fyne.CanvasObject {
-	copyPeer := widget.NewButtonWithIcon("复制 Peer ID", theme.ContentCopyIcon(), func() {
-		fyne.CurrentApp().Clipboard().SetContent(d.peerID.Text)
-	})
-	copyVIP := widget.NewButtonWithIcon("复制虚拟 IP", theme.ContentCopyIcon(), func() {
-		fyne.CurrentApp().Clipboard().SetContent(d.vip.Text)
-	})
-
-	metrics := container.NewGridWithColumns(3,
-		statusTile("CTRL", d.controller, nil),
-		statusTile("PEERS", d.peerCount, nil),
-		statusTile("SYNC", d.updatedAt, nil),
+	meta := container.NewHBox(
+		compactMetric("节点", d.peerCount),
+		compactMetric("同步", d.updatedAt),
 	)
+	return hudPanelWithAction("运行态势", "已连接节点", meta, d.peerListPanel())
+}
 
-	content := container.NewVBox(
-		d.corePanel(),
-		hudDivider(),
-		metrics,
-		hudDivider(),
-		valueRow("虚拟 IP", d.vip),
-		valueRow("Peer ID", d.peerID),
-		container.NewGridWithColumns(2, copyVIP, copyPeer),
-	)
-	return hudPanel("SITUATION CORE", "live node telemetry", content)
+func (d *desktopApp) peerListPanel() fyne.CanvasObject {
+	scroll := container.NewScroll(d.peerList)
+	scroll.SetMinSize(fyne.NewSize(1, 138))
+	header := widget.NewLabelWithStyle("虚拟 IP         连接     主机/系统             操作", fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Monospace: true})
+	return miniPanel(container.NewBorder(header, nil, nil, nil, scroll))
+}
+
+func compactMetric(label string, value *widget.Label) fyne.CanvasObject {
+	caption := canvas.NewText(label, color.NRGBA{R: 0x58, G: 0xc8, B: 0xe2, A: 0xff})
+	caption.TextStyle = fyne.TextStyle{Monospace: true}
+	caption.TextSize = 10
+	value.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+	return container.NewHBox(caption, value)
 }
 
 func (d *desktopApp) corePanel() fyne.CanvasObject {
 	holder := canvas.NewRectangle(color.Transparent)
-	holder.SetMinSize(fyne.NewSize(190, 128))
-	d.coreGlow.Resize(fyne.NewSize(112, 112))
-	d.coreRing.Resize(fyne.NewSize(96, 96))
+	holder.SetMinSize(fyne.NewSize(172, 88))
+	d.coreGlow.Resize(fyne.NewSize(86, 86))
+	d.coreRing.Resize(fyne.NewSize(74, 74))
 	d.coreRing.Move(fyne.NewPos(8, 8))
 
 	dialBg := canvas.NewRadialGradient(
 		color.NRGBA{R: 0x14, G: 0x4d, B: 0x68, A: 0xee},
 		color.NRGBA{R: 0x03, G: 0x08, B: 0x11, A: 0x00},
 	)
-	dialBg.SetMinSize(fyne.NewSize(150, 128))
+	dialBg.SetMinSize(fyne.NewSize(132, 88))
 	dial := container.NewStack(
 		holder,
 		dialBg,
@@ -473,7 +504,7 @@ func (d *desktopApp) installPanel() fyne.CanvasObject {
 		valueRow("配置目录", d.config),
 		valueRow("日志文件", d.logFile),
 	)
-	return hudPanel("INSTALL MATRIX", "service profile", content)
+	return hudPanel("安装配置", "服务参数", content)
 }
 
 func (d *desktopApp) logPanel() fyne.CanvasObject {
@@ -487,7 +518,7 @@ func (d *desktopApp) logPanel() fyne.CanvasObject {
 	floor := canvas.NewRectangle(color.Transparent)
 	floor.SetMinSize(fyne.NewSize(1, logPanelHigh))
 	logs := container.NewStack(floor, logBg, container.NewPadded(d.logScroller))
-	return hudPanelWithAction("EVENT STREAM", "live service trace", d.clearLogButton, logs)
+	return hudPanelWithAction("运行日志", "实时服务输出", d.clearLogButton, logs)
 }
 
 func hudPanel(title, subtitle string, body fyne.CanvasObject) fyne.CanvasObject {
@@ -549,6 +580,18 @@ func statusTile(label string, value *widget.Label, lamp *canvas.Circle) fyne.Can
 	return miniPanel(container.NewBorder(nil, nil, fixedLamp(lamp), nil, content))
 }
 
+func consoleStatusTile(label string, value *widget.Label, lamp *canvas.Circle) fyne.CanvasObject {
+	caption := canvas.NewText(label, color.NRGBA{R: 0x58, G: 0xc8, B: 0xe2, A: 0xff})
+	caption.TextStyle = fyne.TextStyle{Monospace: true}
+	caption.TextSize = 9
+	value.TextStyle = fyne.TextStyle{Bold: true}
+	content := container.NewVBox(caption, value)
+	if lamp == nil {
+		return miniPanel(content)
+	}
+	return miniPanel(container.NewBorder(nil, nil, fixedLamp(lamp), nil, content))
+}
+
 func valueRow(label string, value *widget.Entry) fyne.CanvasObject {
 	caption := widget.NewLabelWithStyle(label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	return container.NewVBox(caption, value)
@@ -560,6 +603,12 @@ func miniPanel(body fyne.CanvasObject) fyne.CanvasObject {
 	bg.StrokeWidth = 1
 	bg.CornerRadius = 6
 	return container.NewStack(bg, container.NewPadded(body))
+}
+
+func scrollPanel(obj fyne.CanvasObject) fyne.CanvasObject {
+	scroll := container.NewScroll(obj)
+	scroll.SetMinSize(fyne.NewSize(1, panelMinHigh))
+	return scroll
 }
 
 func statusLamp(c color.Color) *canvas.Circle {
@@ -669,6 +718,51 @@ func (d *desktopApp) runAction(name string, fn func() error) {
 	}()
 }
 
+func (d *desktopApp) runReconnect(target string) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		target = "all"
+	}
+	d.setBusy(true)
+	d.appendLog("正在请求核心尝试刷新直连链路: %s", target)
+	go func() {
+		err := d.ctrl.Reconnect(target)
+		fyne.Do(func() {
+			d.setBusy(false)
+			if err != nil {
+				d.appendLog("直连重试请求失败: %v", err)
+			} else {
+				d.appendLog("已发送直连重试请求: %s", target)
+			}
+			d.refresh()
+		})
+	}()
+}
+
+func (d *desktopApp) runNetworkTest(target string) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return
+	}
+	d.setBusy(true)
+	d.appendLog("正在测试到 %s 的虚拟网络...", target)
+	go func() {
+		out, err := d.ctrl.Test(target)
+		fyne.Do(func() {
+			d.setBusy(false)
+			if err != nil {
+				d.appendLog("网络测试失败: %s，%v", target, err)
+			} else {
+				d.appendLog("网络测试完成: %s", target)
+			}
+			for _, line := range summarizePingOutput(out) {
+				d.appendLog("%s", line)
+			}
+			d.refresh()
+		})
+	}()
+}
+
 func (d *desktopApp) refresh() {
 	st := d.ctrl.Status()
 	d.installedNow = st.Installed
@@ -708,6 +802,7 @@ func (d *desktopApp) refresh() {
 		d.updatedAt.SetText(defaultText(compactTime(st.State.UpdatedAt)))
 		d.vip.SetText(defaultText(st.State.SelfVIP))
 		d.peerID.SetText(defaultText(st.State.SelfID))
+		d.setPeerList(st.State.Peers)
 		d.coreMode.Text = defaultText(st.State.NodeType)
 		d.coreVIP.Text = defaultText(st.State.SelfVIP)
 	} else {
@@ -717,6 +812,7 @@ func (d *desktopApp) refresh() {
 		d.updatedAt.SetText("-")
 		d.vip.SetText("")
 		d.peerID.SetText("")
+		d.setPeerList(nil)
 		d.coreMode.Text = "-"
 		d.coreVIP.Text = "-"
 	}
@@ -737,12 +833,12 @@ func (d *desktopApp) refresh() {
 
 func (d *desktopApp) refreshCoreState(running bool) {
 	if running {
-		d.coreStatus.Text = "ONLINE"
+		d.coreStatus.Text = "在线"
 		d.coreStatus.Color = color.NRGBA{R: 0x39, G: 0xf7, B: 0x91, A: 0xff}
 		d.coreRing.StrokeColor = color.NRGBA{R: 0x39, G: 0xf7, B: 0x91, A: 0xdd}
 		d.coreGlow.FillColor = color.NRGBA{R: 0x39, G: 0xf7, B: 0x91, A: 0x24}
 	} else {
-		d.coreStatus.Text = "STANDBY"
+		d.coreStatus.Text = "待机"
 		d.coreStatus.Color = color.NRGBA{R: 0xff, G: 0xc8, B: 0x57, A: 0xff}
 		d.coreRing.StrokeColor = color.NRGBA{R: 0xff, G: 0xc8, B: 0x57, A: 0xcc}
 		d.coreGlow.FillColor = color.NRGBA{R: 0xff, G: 0xc8, B: 0x57, A: 0x20}
@@ -774,11 +870,11 @@ func (d *desktopApp) updateControls(st installStatus) {
 
 	switch {
 	case st.Installed && d.reinstalling:
-		d.installButton.SetText("确认重装")
+		d.installButton.SetText("重装")
 		d.cancelButton.Show()
 		d.cancelButton.Enable()
 	case st.Installed:
-		d.installButton.SetText("重新安装")
+		d.installButton.SetText("重装")
 		d.cancelButton.Hide()
 		d.cancelButton.Disable()
 	default:
@@ -803,6 +899,62 @@ func (d *desktopApp) updateControls(st installStatus) {
 	}
 
 	d.updateInstallInputs(!st.Installed || d.reinstalling)
+}
+
+func (d *desktopApp) setPeerList(peers map[string]peerInfo) {
+	d.peerList.Objects = nil
+	if len(peers) == 0 {
+		d.peerList.Add(widget.NewLabelWithStyle("暂无已连接节点", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true}))
+		d.peerList.Refresh()
+		return
+	}
+	keys := make([]string, 0, len(peers))
+	for vip := range peers {
+		keys = append(keys, vip)
+	}
+	sort.Strings(keys)
+	for _, vip := range keys {
+		d.peerList.Add(d.peerRow(vip, peers[vip]))
+	}
+	d.peerList.Refresh()
+}
+
+func (d *desktopApp) peerRow(vip string, p peerInfo) fyne.CanvasObject {
+	mode := "中继"
+	modeColor := theme.ColorNameWarning
+	if p.Direct {
+		mode = "直连"
+		modeColor = theme.ColorNameSuccess
+	} else if !p.Connected {
+		mode = "离线"
+		modeColor = theme.ColorNameError
+	}
+
+	host := defaultValue(firstNonEmpty(p.Hostname, p.OS), "-")
+	if len(host) > 18 {
+		host = host[:18]
+	}
+	infoText := fmt.Sprintf("%-15s %-6s %-18s", vip, mode, host)
+	info := widget.NewRichText(&widget.TextSegment{
+		Style: widget.RichTextStyle{
+			TextStyle: fyne.TextStyle{Monospace: true},
+			ColorName: modeColor,
+		},
+		Text: infoText,
+	})
+	info.Wrapping = fyne.TextWrapOff
+
+	reconnect := widget.NewButtonWithIcon("直连", theme.RadioButtonCheckedIcon(), func() {
+		d.runReconnect(vip)
+	})
+	if p.Direct {
+		reconnect.Disable()
+	}
+	test := widget.NewButtonWithIcon("测试", theme.ConfirmIcon(), func() {
+		d.runNetworkTest(vip)
+	})
+	actions := container.NewHBox(reconnect, test)
+	return miniPanel(container.NewBorder(nil, nil, info, actions, nil))
 }
 
 func (d *desktopApp) applyServiceSettings(settings *serviceSettings) {
@@ -1031,6 +1183,36 @@ func compactTime(s string) string {
 	return s
 }
 
+func summarizePingOutput(out string) []string {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil
+	}
+	lines := normalizeLogLines(out)
+	if len(lines) <= 6 {
+		return lines
+	}
+	picked := make([]string, 0, 6)
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "packets") || strings.Contains(lower, "packet loss") || strings.Contains(lower, "average") || strings.Contains(lower, "min/avg") || strings.Contains(lower, "minimum") || strings.Contains(lower, "maximum") {
+			picked = append(picked, line)
+		}
+	}
+	if len(picked) > 0 {
+		return picked
+	}
+	return lines[len(lines)-6:]
+}
+
+func shortPeerID(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) <= 14 {
+		return defaultValue(id, "-")
+	}
+	return id[:8] + "..." + id[len(id)-5:]
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -1252,6 +1434,25 @@ func (c unixController) Restart() error {
 	return runPrivilegedShell([]string{"/usr/local/bin/meshlink", "restart"})
 }
 
+func (c unixController) Reconnect(target string) error {
+	return runPrivilegedShell([]string{"/usr/local/bin/meshlink", "reconnect", defaultValue(target, "all")})
+}
+
+func (c unixController) Test(target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", errors.New("测试目标为空")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ping", "-c", "4", target)
+	out, err := combinedOutputHidden(cmd)
+	if ctx.Err() == context.DeadlineExceeded {
+		return out, fmt.Errorf("测试超时")
+	}
+	return out, err
+}
+
 func (c unixController) Status() installStatus {
 	st := installStatus{
 		Installed: c.IsInstalled(),
@@ -1326,7 +1527,7 @@ func (c windowsController) IsInstalled() bool {
 
 func (c windowsController) IsRunning() bool {
 	cmd := `if (Get-Process p2p-node -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }`
-	return exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd).Run() == nil
+	return runCmdHidden(exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd)) == nil
 }
 
 func (c windowsController) Install(port, bootstrap string, relay bool) error {
@@ -1340,9 +1541,8 @@ func (c windowsController) Install(port, bootstrap string, relay bool) error {
 	} else if bootstrap != "" {
 		args = append(args, "-bootstrap", bootstrap)
 	}
-	psArgs := windowsPowerShellArgs(args)
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", "Start-Process powershell -ArgumentList "+psArgs+" -Verb RunAs -Wait")
-	return runCmd(cmd)
+	cmd := exec.Command("powershell", append([]string{"-NoProfile"}, args...)...)
+	return runCmdHidden(cmd)
 }
 
 func (c windowsController) Start() error {
@@ -1357,11 +1557,37 @@ func (c windowsController) Restart() error {
 	return c.runManager("restart")
 }
 
+func (c windowsController) Reconnect(target string) error {
+	return c.runManagerWithTarget("reconnect", defaultValue(target, "all"))
+}
+
+func (c windowsController) Test(target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", errors.New("测试目标为空")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ping", "-n", "4", target)
+	out, err := combinedOutputHidden(cmd)
+	if ctx.Err() == context.DeadlineExceeded {
+		return out, fmt.Errorf("测试超时")
+	}
+	return out, err
+}
+
 func (c windowsController) runManager(command string) error {
+	return c.runManagerWithTarget(command, "")
+}
+
+func (c windowsController) runManagerWithTarget(command, target string) error {
 	script := filepath.Join(c.ConfigDir(), "meshlink.ps1")
-	args := windowsPowerShellArgs([]string{"-ExecutionPolicy", "Bypass", "-File", script, "-command", command})
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", "Start-Process powershell -ArgumentList "+args+" -Verb RunAs -Wait")
-	return runCmd(cmd)
+	args := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-command", command}
+	if strings.TrimSpace(target) != "" {
+		args = append(args, "-target", target)
+	}
+	cmd := exec.Command("powershell", args...)
+	return runCmdHidden(cmd)
 }
 
 func (c windowsController) Status() installStatus {
@@ -1374,7 +1600,7 @@ func (c windowsController) Status() installStatus {
 		LogFile:   c.LogFile(),
 	}
 	if st.Installed {
-		settings, err := readEnvSettings(filepath.Join(c.ConfigDir(), "meshlink.env"))
+		settings, err := c.readServiceSettings()
 		if err == nil {
 			st.Settings = settings
 		} else {
@@ -1390,6 +1616,20 @@ func (c windowsController) Status() installStatus {
 
 func (c windowsController) ReadRecentLogs(lines int) string {
 	return tailFile(c.LogFile(), lines)
+}
+
+func (c windowsController) readServiceSettings() (*serviceSettings, error) {
+	envPath := filepath.Join(c.ConfigDir(), "meshlink.env")
+	if settings, err := readEnvSettings(envPath); err == nil {
+		return settings, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%s: %w", envPath, err)
+	}
+	settings, err := readWindowsScheduledTaskSettings("MeshLink")
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", envPath, err)
+	}
+	return settings, nil
 }
 
 func readEnvSettings(path string) (*serviceSettings, error) {
@@ -1449,6 +1689,27 @@ func readLaunchDaemonSettings(path string) (*serviceSettings, error) {
 	return settings, nil
 }
 
+func readWindowsScheduledTaskSettings(taskName string) (*serviceSettings, error) {
+	query := fmt.Sprintf(`$action = (Get-ScheduledTask -TaskName %s -ErrorAction Stop).Actions | Select-Object -First 1; [Console]::Out.Write($action.Arguments)`, powershellSingleQuote(taskName))
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", query)
+	hideCommandWindow(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	args, err := splitWindowsCommandLine(string(out))
+	if err != nil {
+		return nil, err
+	}
+	settings := &serviceSettings{}
+	settings.applyArgs(args)
+	if settings.Port == "" && !settings.Relay && settings.Bootstrap == "" {
+		return nil, fmt.Errorf("未在计划任务 %s 中找到 MeshLink 启动参数", taskName)
+	}
+	settings.Summary = settings.summary()
+	return settings, nil
+}
+
 func (s *serviceSettings) applyArgs(args []string) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1487,14 +1748,16 @@ func (s serviceSettings) summary() string {
 }
 
 func readKeyValueFile(path string) (map[string]string, error) {
-	file, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	if values, ok, err := parseJSONKeyValue(data); ok || err != nil {
+		return values, err
+	}
 
 	values := make(map[string]string)
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1513,6 +1776,34 @@ func readKeyValueFile(path string) (map[string]string, error) {
 		return nil, fmt.Errorf("%s 没有可读配置项", path)
 	}
 	return values, nil
+}
+
+func parseJSONKeyValue(data []byte) (map[string]string, bool, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, false, nil
+	}
+	raw := make(map[string]any)
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return nil, true, err
+	}
+	values := make(map[string]string, len(raw))
+	for key, value := range raw {
+		switch typed := value.(type) {
+		case string:
+			values[key] = strings.TrimSpace(typed)
+		case bool:
+			values[key] = strconv.FormatBool(typed)
+		case float64:
+			values[key] = strconv.FormatFloat(typed, 'f', -1, 64)
+		default:
+			values[key] = strings.TrimSpace(fmt.Sprint(typed))
+		}
+	}
+	if len(values) == 0 {
+		return nil, true, fmt.Errorf("没有可读配置项")
+	}
+	return values, true, nil
 }
 
 func readMeshState(path string) (*meshState, error) {
@@ -1552,6 +1843,17 @@ func runCmd(cmd *exec.Cmd) error {
 		return fmt.Errorf("%v: %s", err, text)
 	}
 	return nil
+}
+
+func runCmdHidden(cmd *exec.Cmd) error {
+	hideCommandWindow(cmd)
+	return runCmd(cmd)
+}
+
+func combinedOutputHidden(cmd *exec.Cmd) (string, error) {
+	hideCommandWindow(cmd)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func findBundledFile(name string) (string, error) {
@@ -1629,14 +1931,6 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-func windowsPowerShellArgs(args []string) string {
-	quoted := make([]string, 0, len(args))
-	for _, arg := range args {
-		quoted = append(quoted, powershellQuote(arg))
-	}
-	return strings.Join(quoted, ",")
-}
-
-func powershellQuote(s string) string {
+func powershellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

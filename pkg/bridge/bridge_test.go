@@ -3,6 +3,8 @@ package bridge
 import (
 	"net"
 	"testing"
+
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func TestIsNoisyLocalIPv4(t *testing.T) {
@@ -24,5 +26,37 @@ func TestIsNoisyLocalIPv4(t *testing.T) {
 				t.Fatalf("isNoisyLocalIPv4(%s) = %v, want %v", tt.ip, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParsePeerMetaAcceptsLegacyHello(t *testing.T) {
+	id, err := peer.Decode("12D3KooWLA8iTGSSJoEoUyPexsLPWvanhcSVq6qW6pdmMaxF3tzh")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var b Bridge
+	meta, ok := b.parsePeerMeta([]string{"HELLO", "10.90.214.210", id.String()})
+	if !ok {
+		t.Fatal("parsePeerMeta returned !ok")
+	}
+	if meta.VIP != "10.90.214.210" || meta.ID != id || meta.OS != "" || meta.Hostname != "" {
+		t.Fatalf("unexpected meta: %+v", meta)
+	}
+}
+
+func TestParsePeerMetaAcceptsExtendedHello(t *testing.T) {
+	id, err := peer.Decode("12D3KooWLA8iTGSSJoEoUyPexsLPWvanhcSVq6qW6pdmMaxF3tzh")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var b Bridge
+	meta, ok := b.parsePeerMeta([]string{"HELLO", "10.90.214.210", id.String(), "windows", "office-pc", "1.1.9"})
+	if !ok {
+		t.Fatal("parsePeerMeta returned !ok")
+	}
+	if meta.VIP != "10.90.214.210" || meta.ID != id || meta.OS != "windows" || meta.Hostname != "office-pc" || meta.Version != "1.1.9" {
+		t.Fatalf("unexpected meta: %+v", meta)
 	}
 }
